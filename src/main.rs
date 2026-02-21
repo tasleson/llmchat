@@ -13,6 +13,12 @@ use std::{
     process::Command,
     time::Instant,
 };
+use syntect::{
+    easy::HighlightLines,
+    highlighting::{Style, ThemeSet},
+    parsing::SyntaxSet,
+    util::{as_24_bit_terminal_escaped, LinesWithEndings},
+};
 use tempfile::NamedTempFile;
 
 #[derive(Parser)]
@@ -34,6 +40,164 @@ struct Args {
 struct Message {
     role: String,
     content: String,
+}
+
+/// State machine for streaming markdown rendering
+struct MarkdownStreamer {
+    buffer: String,
+    in_code_block: bool,
+    code_language: String,
+    code_buffer: String,
+    syntax_set: SyntaxSet,
+    theme_set: ThemeSet,
+}
+
+impl MarkdownStreamer {
+    fn new() -> Self {
+        Self {
+            buffer: String::new(),
+            in_code_block: false,
+            code_language: String::new(),
+            code_buffer: String::new(),
+            syntax_set: SyntaxSet::load_defaults_newlines(),
+            theme_set: ThemeSet::load_defaults(),
+        }
+    }
+
+    /// Process incoming token and print formatted output
+    fn process_token(&mut self, token: &str) -> io::Result<()> {
+        self.buffer.push_str(token);
+
+        // Check for complete lines to process
+        while let Some(newline_pos) = self.buffer.find('\n') {
+            let line = self.buffer[..=newline_pos].to_string();
+            self.buffer.drain(..=newline_pos);
+
+            self.process_line(&line)?;
+        }
+
+        Ok(())
+    }
+
+    fn process_line(&mut self, line: &str) -> io::Result<()> {
+        // Detect code block boundaries
+        if line.trim_start().starts_with("```") {
+            if self.in_code_block {
+                // Closing code block - highlight and print
+                self.print_code_block()?;
+                print!("{}", "```".truecolor(100, 100, 100));
+                if line.len() > 3 {
+                    print!("{}", &line[3..].truecolor(100, 100, 100));
+                }
+                self.in_code_block = false;
+                self.code_language.clear();
+                self.code_buffer.clear();
+            } else {
+                // Opening code block
+                self.in_code_block = true;
+                self.code_language = line.trim_start()[3..].trim().to_string();
+                print!("{}", "```".truecolor(100, 100, 100));
+                if !self.code_language.is_empty() {
+                    print!("{}", self.code_language.truecolor(100, 100, 100));
+                }
+                println!();
+            }
+        } else if self.in_code_block {
+            // Accumulate code block content
+            self.code_buffer.push_str(line);
+        } else {
+            // Regular text - apply basic markdown formatting
+            self.print_formatted_line(line)?;
+        }
+
+        Ok(())
+    }
+
+    fn print_code_block(&mut self) -> io::Result<()> {
+        if self.code_buffer.is_empty() {
+            return Ok(());
+        }
+
+        // Use a light theme suitable for white backgrounds
+        let theme = &self.theme_set.themes["InspiredGitHub"];
+        let syntax = self
+            .syntax_set
+            .find_syntax_by_token(&self.code_language)
+            .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
+
+        let mut highlighter = HighlightLines::new(syntax, theme);
+
+        for line in LinesWithEndings::from(&self.code_buffer) {
+            let ranges: Vec<(Style, &str)> = highlighter
+                .highlight_line(line, &self.syntax_set)
+                .unwrap_or_default();
+            let escaped = as_24_bit_terminal_escaped(&ranges[..], false);
+            print!("{}", escaped);
+        }
+
+        io::stdout().flush()
+    }
+
+    fn print_formatted_line(&self, line: &str) -> io::Result<()> {
+        // Simple formatting for common markdown patterns
+        let result;
+
+        // Headers (use dark colors for light backgrounds)
+        if let Some(stripped) = line.strip_prefix("###") {
+            result = stripped.trim().blue().bold().to_string() + "\n";
+        } else if let Some(stripped) = line.strip_prefix("##") {
+            result = stripped.trim().blue().bold().to_string() + "\n";
+        } else if let Some(stripped) = line.strip_prefix("#") {
+            result = stripped.trim().blue().bold().to_string() + "\n";
+        } else {
+            // Inline code with `backticks`
+            result = self.highlight_inline_code(line);
+        }
+
+        print!("{}", result.black());
+        io::stdout().flush()
+    }
+
+    fn highlight_inline_code(&self, text: &str) -> String {
+        let mut result = String::new();
+        let mut in_backtick = false;
+        let mut current = String::new();
+
+        for ch in text.chars() {
+            if ch == '`' {
+                if in_backtick {
+                    // Closing backtick - format as code (dark text on light gray background)
+                    result.push_str(&format!("{}", current.black().on_truecolor(230, 230, 230)));
+                    current.clear();
+                } else {
+                    // Opening backtick - flush any normal text
+                    result.push_str(&current);
+                    current.clear();
+                }
+                in_backtick = !in_backtick;
+            } else {
+                current.push(ch);
+            }
+        }
+
+        result.push_str(&current);
+        result
+    }
+
+    /// Flush any remaining buffered content
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.buffer.is_empty() {
+            let remaining = self.buffer.clone();
+            self.buffer.clear();
+
+            if self.in_code_block {
+                print!("{}", remaining.black());
+            } else {
+                self.print_formatted_line(&remaining)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[tokio::main]
@@ -232,6 +396,7 @@ async fn handle_prompt(
     let mut stream = response.bytes_stream();
     let mut assistant_reply = String::new();
     let mut received_any_data = false;
+    let mut md_streamer = MarkdownStreamer::new();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
@@ -251,8 +416,7 @@ async fn handle_prompt(
                             first_token_time = Some(Instant::now());
                         }
 
-                        print!("{}", token.bright_cyan());
-                        io::stdout().flush().unwrap();
+                        md_streamer.process_token(token)?;
                         assistant_reply.push_str(token);
                         token_count += 1;
                     }
@@ -260,6 +424,9 @@ async fn handle_prompt(
             }
         }
     }
+
+    // Flush any remaining buffered content
+    md_streamer.flush()?;
 
     spinner.finish_and_clear();
 
