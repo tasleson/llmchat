@@ -279,6 +279,19 @@ fn open_editor() -> Result<String> {
     Ok(fs::read_to_string(tmp.path())?)
 }
 
+fn create_spinner(message: &str) -> ProgressBar {
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::default_spinner()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
+            .template("{spinner:.cyan} {msg}")
+            .unwrap(),
+    );
+    spinner.set_message(message.to_string());
+    spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+    spinner
+}
+
 async fn handle_command(
     cmd: &str,
     messages: &mut Vec<Message>,
@@ -374,16 +387,7 @@ async fn handle_prompt(
     let client = reqwest::Client::new();
     let url = format!("{}/chat/completions", args.endpoint);
 
-    // Create spinner
-    let spinner = ProgressBar::new_spinner();
-    spinner.set_style(
-        ProgressStyle::default_spinner()
-            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
-            .template("{spinner:.cyan} {msg}")
-            .unwrap(),
-    );
-    spinner.set_message("Waiting for response...");
-    spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+    let spinner = create_spinner("Waiting for response...");
 
     let start_time = Instant::now();
     let mut first_token_time: Option<Instant> = None;
