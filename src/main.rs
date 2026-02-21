@@ -285,9 +285,50 @@ async fn handle_command(
     system_prompt: &mut Option<String>,
     args: &Args,
 ) -> Result<bool> {
+    const HELP_WIDTH: usize = 16;
     let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
 
     match parts[0] {
+        "/help" => {
+            println!("{}", "Available Commands:".green().bold());
+            println!();
+            println!(
+                "  {:<width$}  Exit the program",
+                "/exit".cyan(),
+                width = HELP_WIDTH
+            );
+            println!(
+                "  {:<width$}  Clear conversation history (removes all previous messages)",
+                "/clear".cyan(),
+                width = HELP_WIDTH
+            );
+            println!(
+                "  {:<width$}  Open your default editor (${}) for multi-line input",
+                "/edit".cyan(),
+                "EDITOR".yellow(),
+                width = HELP_WIDTH
+            );
+            println!(
+                "  {:<width$}  Set a system prompt for the conversation",
+                "/system <prompt>".cyan(),
+                width = HELP_WIDTH
+            );
+            println!(
+                "  {:<width$}  Example: /system You are a helpful coding assistant",
+                "".dimmed(),
+                width = HELP_WIDTH
+            );
+            println!(
+                "  {:<width$}  Show this help message",
+                "/help".cyan(),
+                width = HELP_WIDTH
+            );
+            println!();
+            println!(
+                "{}",
+                "Tip: Use Ctrl+D or Ctrl+C to exit at any time".dimmed()
+            );
+        }
         "/exit" => return Ok(true),
         "/clear" => {
             messages.clear();
@@ -303,7 +344,7 @@ async fn handle_command(
                 println!("System prompt set.");
             }
         }
-        _ => println!("Unknown command, try /exit, /clear, /edit, /system"),
+        _ => println!("Unknown command. Type /help for available commands."),
     }
 
     Ok(false)
