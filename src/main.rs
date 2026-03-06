@@ -1,8 +1,20 @@
 use anyhow::Result;
 use clap::Parser;
 use colored::Colorize;
+use crossterm::{
+    event::{self, Event, KeyCode, KeyModifiers},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
 use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::Style as RatatuiStyle,
+    widgets::{Block, Borders},
+    Terminal,
+};
 use rustyline::{history::DefaultHistory, Editor};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -20,6 +32,7 @@ use syntect::{
     util::{as_24_bit_terminal_escaped, LinesWithEndings},
 };
 use tempfile::NamedTempFile;
+use tui_textarea::TextArea;
 
 #[derive(Parser)]
 struct Args {
@@ -34,6 +47,10 @@ struct Args {
 
     /// Optional one-shot prompt
     prompt: Option<String>,
+
+    /// Use internal multiline editor instead of external $EDITOR
+    #[arg(long, default_value = "false")]
+    internal_editor: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -244,7 +261,8 @@ async fn main() -> Result<()> {
                     save_session(&args.session, &messages)?;
                     continue;
                 }
-
+                // Lets add a newline to create a clearer boundary between request and response
+                println!();
                 handle_prompt(input.to_string(), &mut messages, &args, &system_prompt).await?;
                 save_session(&args.session, &messages)?;
             }
@@ -272,11 +290,68 @@ fn save_session(path: &Option<PathBuf>, messages: &[Message]) -> Result<()> {
     Ok(())
 }
 
-fn open_editor() -> Result<String> {
+fn open_internal_editor() -> Result<String> {
+    // Setup terminal
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    // Create text area widget
+    let mut textarea = TextArea::default();
+    textarea.set_block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Multi-line Editor - Press Esc or Ctrl+D to finish "),
+    );
+    // Remove the cursor line underline styling
+    textarea.set_cursor_line_style(RatatuiStyle::default());
+
+    // Event loop
+    loop {
+        terminal.draw(|f| {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1)])
+                .split(f.area());
+            f.render_widget(&textarea, chunks[0]);
+        })?;
+
+        if let Event::Key(key) = event::read()? {
+            match (key.code, key.modifiers) {
+                (KeyCode::Esc, _) => break,
+                (KeyCode::Char('d'), KeyModifiers::CONTROL) => break,
+                _ => {
+                    textarea.input(key);
+                }
+            }
+        }
+    }
+
+    // Cleanup terminal
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    // Get the content
+    let content = textarea.lines().join("\n");
+    Ok(content)
+}
+
+fn open_external_editor() -> Result<String> {
     let tmp = NamedTempFile::new()?;
     let editor = env::var("EDITOR").unwrap_or_else(|_| "vim".into());
     Command::new(editor).arg(tmp.path()).status()?;
     Ok(fs::read_to_string(tmp.path())?)
+}
+
+fn open_editor(use_internal: bool) -> Result<String> {
+    if use_internal {
+        open_internal_editor()
+    } else {
+        open_external_editor()
+    }
 }
 
 fn create_spinner(message: &str) -> ProgressBar {
@@ -348,7 +423,10 @@ async fn handle_command(
             println!("Session cleared.");
         }
         "/edit" => {
-            let content = open_editor()?;
+            let content = open_editor(args.internal_editor)?;
+            // Lets output the prompt, so that the user can see exactly what they sent to the
+            // model
+            println!("{content}");
             handle_prompt(content, messages, args, system_prompt).await?;
         }
         "/system" => {
@@ -369,9 +447,16 @@ async fn handle_prompt(
     args: &Args,
     system_prompt: &Option<String>,
 ) -> Result<()> {
+    let trimmed = input.trim().to_string();
+
+    if trimmed.is_empty() {
+        println!("Empty input, please try again!");
+        return Ok(());
+    }
+
     messages.push(Message {
         role: "user".into(),
-        content: input,
+        content: trimmed,
     });
 
     let mut payload_msgs = vec![];
