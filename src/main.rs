@@ -135,6 +135,7 @@ struct BenchmarkSummary {
     total_time: f64,
     total_tokens: usize,
     total_tokens_all_actual: bool,
+    responses_hash: String,
     ttft_avg: f64,
     ttft_median: f64,
     ttft_min: f64,
@@ -1062,6 +1063,13 @@ fn calculate_summary(metrics: &[PromptMetrics]) -> BenchmarkSummary {
     let total_tokens: usize = metrics.iter().map(|m| m.tokens).sum();
     let total_tokens_all_actual = metrics.iter().all(|m| m.tokens_actual);
 
+    // Calculate hash of all response hashes
+    let mut hasher = Sha256::new();
+    for m in metrics {
+        hasher.update(m.response_hash.as_bytes());
+    }
+    let responses_hash = hex::encode(hasher.finalize());
+
     let ttfts: Vec<f64> = metrics.iter().map(|m| m.ttft.as_secs_f64()).collect();
     let speeds: Vec<f64> = metrics.iter().map(|m| m.speed).collect();
 
@@ -1070,6 +1078,7 @@ fn calculate_summary(metrics: &[PromptMetrics]) -> BenchmarkSummary {
         total_time,
         total_tokens,
         total_tokens_all_actual,
+        responses_hash,
         ttft_avg: calculate_mean(&ttfts),
         ttft_median: calculate_median(&ttfts),
         ttft_min: ttfts.iter().cloned().fold(f64::INFINITY, f64::min),
@@ -1157,6 +1166,7 @@ fn display_benchmark_results(
     } else {
         println!("  Total Tokens: ~{} (estimated)", summary.total_tokens);
     }
+    println!("  Responses Hash: {:.16}...", summary.responses_hash);
     println!();
     println!("{}", "  TTFT (Time to First Token):".cyan().bold());
     println!(
