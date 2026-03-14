@@ -73,6 +73,10 @@ struct Args {
     /// Output file for benchmark results (JSON)
     #[arg(long)]
     benchmark_output: Option<PathBuf>,
+
+    /// Maximum context window size in tokens (auto-detected from model if available)
+    #[arg(long, default_value = "8192")]
+    max_tokens: usize,
 }
 
 struct SessionConfig {
@@ -105,6 +109,7 @@ struct PromptMetrics {
     ttft: Duration,
     total_time: Duration,
     tokens: usize,
+    tokens_actual: bool,
     speed: f64,
     response_length: usize,
     response_hash: String,
@@ -129,6 +134,7 @@ struct BenchmarkSummary {
     total_prompts: usize,
     total_time: f64,
     total_tokens: usize,
+    total_tokens_all_actual: bool,
     ttft_avg: f64,
     ttft_median: f64,
     ttft_min: f64,
@@ -308,7 +314,19 @@ impl MarkdownStreamer {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    // Try to auto-detect context window from model info
+    if let Some(detected_context) = fetch_model_context_window(&args.endpoint, &args.model).await {
+        if args.max_tokens == 8192 {
+            // Only override if using default value
+            args.max_tokens = detected_context;
+            eprintln!(
+                "{}",
+                format!("Auto-detected context window: {} tokens", detected_context).dimmed()
+            );
+        }
+    }
 
     // --- Benchmark mode ---
     if let Some(ref benchmark_file) = args.benchmark {
@@ -321,7 +339,7 @@ async fn main() -> Result<()> {
 
     // --- One-shot from CLI argument ---
     if let Some(ref p) = args.prompt {
-        handle_prompt(p.clone(), &mut messages, &args, &config).await?;
+        let (_metrics, _total) = handle_prompt(p.clone(), &mut messages, &args, &config).await?;
         save_session(&args.session, &messages)?;
         return Ok(());
     }
@@ -330,7 +348,7 @@ async fn main() -> Result<()> {
     if !atty::is(atty::Stream::Stdin) {
         let mut input = String::new();
         io::stdin().read_to_string(&mut input)?;
-        handle_prompt(input, &mut messages, &args, &config).await?;
+        let (_metrics, _total) = handle_prompt(input, &mut messages, &args, &config).await?;
         save_session(&args.session, &messages)?;
         return Ok(());
     }
@@ -359,7 +377,8 @@ async fn main() -> Result<()> {
                 }
                 // Lets add a newline to create a clearer boundary between request and response
                 println!();
-                handle_prompt(input.to_string(), &mut messages, &args, &config).await?;
+                let (_metrics, _total) =
+                    handle_prompt(input.to_string(), &mut messages, &args, &config).await?;
                 save_session(&args.session, &messages)?;
             }
             Err(_) => break,
@@ -384,6 +403,89 @@ fn save_session(path: &Option<PathBuf>, messages: &[Message]) -> Result<()> {
         fs::write(p, serde_json::to_string_pretty(messages)?)?;
     }
     Ok(())
+}
+
+fn estimate_tokens(messages: &[Message], system_prompt: &Option<String>) -> usize {
+    // Rough estimation: ~4 characters per token
+    let mut total_chars: usize = messages.iter().map(|m| m.content.len()).sum();
+    if let Some(sp) = system_prompt {
+        total_chars += sp.len();
+    }
+    total_chars / 4
+}
+
+fn check_context_usage(
+    messages: &[Message],
+    max_tokens: usize,
+    actual_total: Option<usize>,
+    system_prompt: &Option<String>,
+) {
+    let (token_count, is_actual) = if let Some(actual) = actual_total {
+        (actual, true)
+    } else {
+        (estimate_tokens(messages, system_prompt), false)
+    };
+
+    let percentage = (token_count as f64 / max_tokens as f64) * 100.0;
+
+    if percentage >= 90.0 {
+        eprintln!(
+            "{}",
+            format!(
+                "⚠️  WARNING: Context window usage at {:.1}% ({} / {}) {}",
+                percentage,
+                if is_actual { "ACTUAL:" } else { "ESTIMATED:" },
+                token_count,
+                max_tokens
+            )
+            .yellow()
+        );
+    } else if percentage >= 75.0 {
+        eprintln!(
+            "{}",
+            format!(
+                "Notice: Context window usage at {:.1}% ({} / {}) {}",
+                percentage,
+                if is_actual { "ACTUAL:" } else { "ESTIMATED:" },
+                token_count,
+                max_tokens
+            )
+            .yellow()
+        );
+    }
+}
+
+async fn fetch_model_context_window(endpoint: &str, model: &str) -> Option<usize> {
+    let client = reqwest::Client::new();
+    let models_url = format!("{}/models", endpoint);
+
+    let response = client.get(&models_url).send().await.ok()?;
+    let models_data: serde_json::Value = response.json().await.ok()?;
+
+    let models_array = models_data.get("data")?.as_array()?;
+
+    for model_info in models_array {
+        if model_info.get("id")?.as_str()? == model {
+            // Try to find context window in various possible fields
+            let possible_fields = [
+                "context_window",
+                "max_tokens",
+                "context_length",
+                "max_model_len",
+                "max_position_embeddings",
+            ];
+
+            for field in &possible_fields {
+                if let Some(value) = model_info.get(field) {
+                    if let Some(num) = value.as_u64() {
+                        return Some(num as usize);
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn open_internal_editor() -> Result<String> {
@@ -553,7 +655,7 @@ async fn handle_command(
             // Lets output the prompt, so that the user can see exactly what they sent to the
             // model
             println!("{content}");
-            handle_prompt(content, messages, args, config).await?;
+            let (_metrics, _total) = handle_prompt(content, messages, args, config).await?;
         }
         "/system" => {
             if parts.len() > 1 {
@@ -627,12 +729,12 @@ async fn handle_prompt(
     messages: &mut Vec<Message>,
     args: &Args,
     config: &SessionConfig,
-) -> Result<Option<PromptMetrics>> {
+) -> Result<(Option<PromptMetrics>, Option<usize>)> {
     let trimmed = input.trim().to_string();
 
     if trimmed.is_empty() {
         println!("Empty input, please try again!");
-        return Ok(None);
+        return Ok((None, None));
     }
 
     messages.push(Message {
@@ -793,6 +895,7 @@ async fn handle_prompt(
         ttft: ttft_duration,
         total_time,
         tokens: token_count,
+        tokens_actual: false,
         speed: if let Some(ttft_duration) = ttft {
             let generation_time = total_time.as_secs_f64() - ttft_duration.as_secs_f64();
             if generation_time > 0.0 && token_count > 0 {
@@ -812,7 +915,7 @@ async fn handle_prompt(
         content: assistant_reply,
     });
 
-    Ok(metrics)
+    Ok((metrics, None))
 }
 
 async fn run_benchmark(benchmark_file: &PathBuf, args: &Args) -> Result<()> {
@@ -869,8 +972,9 @@ async fn run_benchmark(benchmark_file: &PathBuf, args: &Args) -> Result<()> {
         );
         println!("{}", "━".repeat(80).dimmed());
 
-        if let Some(metrics) = handle_prompt(prompt.clone(), &mut messages, args, &config).await? {
-            all_metrics.push(metrics);
+        let (metrics, _total) = handle_prompt(prompt.clone(), &mut messages, args, &config).await?;
+        if let Some(m) = metrics {
+            all_metrics.push(m);
         }
 
         println!();
@@ -926,6 +1030,7 @@ fn calculate_summary(metrics: &[PromptMetrics]) -> BenchmarkSummary {
     let total_prompts = metrics.len();
     let total_time: f64 = metrics.iter().map(|m| m.total_time.as_secs_f64()).sum();
     let total_tokens: usize = metrics.iter().map(|m| m.tokens).sum();
+    let total_tokens_all_actual = metrics.iter().all(|m| m.tokens_actual);
 
     let ttfts: Vec<f64> = metrics.iter().map(|m| m.ttft.as_secs_f64()).collect();
     let speeds: Vec<f64> = metrics.iter().map(|m| m.speed).collect();
@@ -934,6 +1039,7 @@ fn calculate_summary(metrics: &[PromptMetrics]) -> BenchmarkSummary {
         total_prompts,
         total_time,
         total_tokens,
+        total_tokens_all_actual,
         ttft_avg: calculate_mean(&ttfts),
         ttft_median: calculate_median(&ttfts),
         ttft_min: ttfts.iter().cloned().fold(f64::INFINITY, f64::min),
