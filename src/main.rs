@@ -186,13 +186,14 @@ impl MarkdownStreamer {
 
     fn process_line(&mut self, line: &str) -> io::Result<()> {
         // Detect code block boundaries
-        if line.trim_start().starts_with("```") {
+        let trimmed = line.trim_start();
+        if let Some(after_backticks) = trimmed.strip_prefix("```") {
             if self.in_code_block {
                 // Closing code block - highlight and print
                 self.print_code_block()?;
                 print!("{}", "```".truecolor(100, 100, 100));
-                if line.len() > 3 {
-                    print!("{}", &line[3..].truecolor(100, 100, 100));
+                if !after_backticks.is_empty() {
+                    print!("{}", after_backticks.truecolor(100, 100, 100));
                 }
                 self.in_code_block = false;
                 self.code_language.clear();
@@ -200,7 +201,7 @@ impl MarkdownStreamer {
             } else {
                 // Opening code block
                 self.in_code_block = true;
-                self.code_language = line.trim_start()[3..].trim().to_string();
+                self.code_language = after_backticks.trim().to_string();
                 print!("{}", "```".truecolor(100, 100, 100));
                 if !self.code_language.is_empty() {
                     print!("{}", self.code_language.truecolor(100, 100, 100));
@@ -248,11 +249,11 @@ impl MarkdownStreamer {
         let result;
 
         // Headers (use dark colors for light backgrounds)
-        if let Some(stripped) = line.strip_prefix("###") {
+        if let Some(stripped) = line.strip_prefix("### ") {
             result = stripped.trim().blue().bold().to_string() + "\n";
-        } else if let Some(stripped) = line.strip_prefix("##") {
+        } else if let Some(stripped) = line.strip_prefix("## ") {
             result = stripped.trim().blue().bold().to_string() + "\n";
-        } else if let Some(stripped) = line.strip_prefix("#") {
+        } else if let Some(stripped) = line.strip_prefix("# ") {
             result = stripped.trim().blue().bold().to_string() + "\n";
         } else {
             // Inline code with `backticks`
@@ -851,7 +852,10 @@ async fn run_benchmark(benchmark_file: &PathBuf, args: &Args) -> Result<()> {
     let mut metrics_monitor = MetricsMonitor::new().ok();
     if let Some(ref mut monitor) = metrics_monitor {
         if let Err(e) = monitor.start() {
-            eprintln!("{}", format!("Warning: Failed to start metrics monitoring: {}", e).yellow());
+            eprintln!(
+                "{}",
+                format!("Warning: Failed to start metrics monitoring: {}", e).yellow()
+            );
             metrics_monitor = None;
         }
     }
@@ -877,7 +881,10 @@ async fn run_benchmark(benchmark_file: &PathBuf, args: &Args) -> Result<()> {
         match monitor.stop() {
             Ok(stats) => Some(stats),
             Err(e) => {
-                eprintln!("{}", format!("Warning: Failed to collect system metrics: {}", e).yellow());
+                eprintln!(
+                    "{}",
+                    format!("Warning: Failed to collect system metrics: {}", e).yellow()
+                );
                 None
             }
         }
@@ -970,7 +977,11 @@ fn calculate_stddev(values: &[f64]) -> f64 {
     variance.sqrt()
 }
 
-fn display_benchmark_results(metrics: &[PromptMetrics], summary: &BenchmarkSummary, system_metrics: &Option<SystemMetricsStats>) {
+fn display_benchmark_results(
+    metrics: &[PromptMetrics],
+    summary: &BenchmarkSummary,
+    system_metrics: &Option<SystemMetricsStats>,
+) {
     println!("{}", "━".repeat(80).green());
     println!("{}", "PER-PROMPT RESULTS".green().bold());
     println!("{}", "━".repeat(80).green());
@@ -1024,7 +1035,10 @@ fn display_benchmark_results(metrics: &[PromptMetrics], summary: &BenchmarkSumma
         println!("{}", "━".repeat(80).green());
         println!("{}", "SYSTEM METRICS".green().bold());
         println!("{}", "━".repeat(80).green());
-        println!("  Samples: {} (~{:.1}s)", sm.sample_count, sm.duration_seconds);
+        println!(
+            "  Samples: {} (~{:.1}s)",
+            sm.sample_count, sm.duration_seconds
+        );
         println!();
 
         println!("{}", "  Efficiency Cores:".cyan().bold());
@@ -1064,10 +1078,7 @@ fn display_benchmark_results(metrics: &[PromptMetrics], summary: &BenchmarkSumma
         println!("{}", "  GPU:".cyan().bold());
         println!(
             "    Freq (MHz):  Min: {:.0} | Mean: {:.0} | Median: {:.0} | Max: {:.0}",
-            sm.gpu.freq_mhz_min,
-            sm.gpu.freq_mhz_mean,
-            sm.gpu.freq_mhz_median,
-            sm.gpu.freq_mhz_max
+            sm.gpu.freq_mhz_min, sm.gpu.freq_mhz_mean, sm.gpu.freq_mhz_median, sm.gpu.freq_mhz_max
         );
         println!(
             "    Usage (%):   Min: {:.1} | Mean: {:.1} | Median: {:.1} | Max: {:.1}",
