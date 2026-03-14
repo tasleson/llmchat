@@ -1127,11 +1127,17 @@ fn display_benchmark_results(
     table.set_header(vec!["#", "TTFT", "Time", "Tokens", "Speed", "Len", "Hash"]);
 
     for (idx, m) in metrics.iter().enumerate() {
+        let tokens_str = if m.tokens_actual {
+            format!("{}", m.tokens)
+        } else {
+            format!("~{}", m.tokens)
+        };
+
         table.add_row(vec![
             format!("{}", idx + 1),
             format!("{:.2}s", m.ttft.as_secs_f64()),
             format!("{:.2}s", m.total_time.as_secs_f64()),
-            format!("{}", m.tokens),
+            tokens_str,
             format!("{:.1} t/s", m.speed),
             format!("{}", m.response_length),
             format!("{:.8}", m.response_hash),
@@ -1146,7 +1152,11 @@ fn display_benchmark_results(
     println!("{}", "━".repeat(80).green());
     println!("  Prompts:      {}", summary.total_prompts);
     println!("  Total Time:   {:.2}s", summary.total_time);
-    println!("  Total Tokens: {}", summary.total_tokens);
+    if summary.total_tokens_all_actual {
+        println!("  Total Tokens: {} (actual)", summary.total_tokens);
+    } else {
+        println!("  Total Tokens: ~{} (estimated)", summary.total_tokens);
+    }
     println!();
     println!("{}", "  TTFT (Time to First Token):".cyan().bold());
     println!(
