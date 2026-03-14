@@ -377,8 +377,14 @@ async fn main() -> Result<()> {
                 }
                 // Lets add a newline to create a clearer boundary between request and response
                 println!();
-                let (_metrics, _total) =
+                let (_metrics, actual_total) =
                     handle_prompt(input.to_string(), &mut messages, &args, &config).await?;
+                check_context_usage(
+                    &messages,
+                    args.max_tokens,
+                    actual_total,
+                    &config.system_prompt,
+                );
                 save_session(&args.session, &messages)?;
             }
             Err(_) => break,
@@ -635,6 +641,11 @@ async fn handle_command(
                 width = HELP_WIDTH
             );
             println!(
+                "  {:<width$}  Show session info and token usage",
+                "/info".cyan(),
+                width = HELP_WIDTH
+            );
+            println!(
                 "  {:<width$}  Show this help message",
                 "/help".cyan(),
                 width = HELP_WIDTH
@@ -708,6 +719,7 @@ async fn handle_command(
             println!("{}", "Current Configuration:".green().bold());
             println!("  Model:       {}", args.model.cyan());
             println!("  Endpoint:    {}", args.endpoint.cyan());
+            println!("  Max tokens:  {}", args.max_tokens.to_string().cyan());
             println!("  Temperature: {}", config.temperature.to_string().cyan());
             match config.seed {
                 Some(s) => println!("  Seed:        {}", s.to_string().cyan()),
@@ -717,6 +729,24 @@ async fn handle_command(
                 Some(sp) => println!("  System:      {}", sp.cyan()),
                 None => println!("  System:      {}", "None".dimmed()),
             }
+        }
+        "/info" => {
+            let max_tokens = args.max_tokens;
+
+            println!("{}", "Session Information:".green().bold());
+            println!("  Messages:    {}", messages.len());
+
+            let estimated = estimate_tokens(messages, &config.system_prompt);
+            let percentage = (estimated as f64 / max_tokens as f64) * 100.0;
+            println!(
+                "  {}",
+                format!(
+                    "Tokens (ESTIMATE): ~{} / {} ({:.1}%)",
+                    estimated, max_tokens, percentage
+                )
+                .yellow()
+            );
+            println!("  {}", "└─ Based on ~4 chars/token".dimmed());
         }
         _ => println!("Unknown command. Type /help for available commands."),
     }
