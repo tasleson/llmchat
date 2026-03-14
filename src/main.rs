@@ -1,6 +1,10 @@
+mod system_metrics;
+
 use anyhow::Result;
+use chrono::Utc;
 use clap::Parser;
 use colored::Colorize;
+use comfy_table::{presets::UTF8_FULL, Table};
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
@@ -18,12 +22,13 @@ use ratatui::{
 use rustyline::{history::DefaultHistory, Editor};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{
     env, fs,
     io::{self, Read, Write},
     path::PathBuf,
     process::Command,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use syntect::{
     easy::HighlightLines,
@@ -31,6 +36,7 @@ use syntect::{
     parsing::SyntaxSet,
     util::{as_24_bit_terminal_escaped, LinesWithEndings},
 };
+use system_metrics::{MetricsMonitor, SystemMetricsStats};
 use tempfile::NamedTempFile;
 use tui_textarea::TextArea;
 
@@ -59,6 +65,14 @@ struct Args {
     /// Seed for reproducible outputs
     #[arg(long)]
     seed: Option<i64>,
+
+    /// Run benchmark from YAML file
+    #[arg(long)]
+    benchmark: Option<PathBuf>,
+
+    /// Output file for benchmark results (JSON)
+    #[arg(long)]
+    benchmark_output: Option<PathBuf>,
 }
 
 struct SessionConfig {
@@ -75,6 +89,56 @@ impl SessionConfig {
             seed,
         }
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct BenchmarkConfig {
+    name: String,
+    temperature: f32,
+    seed: Option<i64>,
+    prompts: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct PromptMetrics {
+    prompt: String,
+    ttft: Duration,
+    total_time: Duration,
+    tokens: usize,
+    speed: f64,
+    response_length: usize,
+    response_hash: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct BenchmarkResults {
+    name: String,
+    model: String,
+    endpoint: String,
+    temperature: f32,
+    seed: Option<i64>,
+    timestamp: String,
+    prompts: Vec<PromptMetrics>,
+    summary: BenchmarkSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system_metrics: Option<SystemMetricsStats>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct BenchmarkSummary {
+    total_prompts: usize,
+    total_time: f64,
+    total_tokens: usize,
+    ttft_avg: f64,
+    ttft_median: f64,
+    ttft_min: f64,
+    ttft_max: f64,
+    ttft_stddev: f64,
+    speed_avg: f64,
+    speed_median: f64,
+    speed_min: f64,
+    speed_max: f64,
+    speed_stddev: f64,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -244,6 +308,13 @@ impl MarkdownStreamer {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    // --- Benchmark mode ---
+    if let Some(ref benchmark_file) = args.benchmark {
+        run_benchmark(benchmark_file, &args).await?;
+        return Ok(());
+    }
+
     let mut messages = load_session(&args.session)?;
     let mut config = SessionConfig::new(args.temperature, args.seed);
 
@@ -555,12 +626,12 @@ async fn handle_prompt(
     messages: &mut Vec<Message>,
     args: &Args,
     config: &SessionConfig,
-) -> Result<()> {
+) -> Result<Option<PromptMetrics>> {
     let trimmed = input.trim().to_string();
 
     if trimmed.is_empty() {
         println!("Empty input, please try again!");
-        return Ok(());
+        return Ok(None);
     }
 
     messages.push(Message {
@@ -711,10 +782,344 @@ async fn handle_prompt(
 
     println!("{}", format!("[{}]", stats.join(" | ")).dimmed());
 
+    // Calculate hash of response
+    let mut hasher = Sha256::new();
+    hasher.update(assistant_reply.as_bytes());
+    let response_hash = hex::encode(hasher.finalize());
+
+    let metrics = ttft.map(|ttft_duration| PromptMetrics {
+        prompt: messages.last().unwrap().content.clone(),
+        ttft: ttft_duration,
+        total_time,
+        tokens: token_count,
+        speed: if let Some(ttft_duration) = ttft {
+            let generation_time = total_time.as_secs_f64() - ttft_duration.as_secs_f64();
+            if generation_time > 0.0 && token_count > 0 {
+                token_count as f64 / generation_time
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        },
+        response_length: assistant_reply.len(),
+        response_hash: response_hash.clone(),
+    });
+
     messages.push(Message {
         role: "assistant".into(),
         content: assistant_reply,
     });
 
+    Ok(metrics)
+}
+
+async fn run_benchmark(benchmark_file: &PathBuf, args: &Args) -> Result<()> {
+    let yaml_content = fs::read_to_string(benchmark_file)?;
+    let benchmark: BenchmarkConfig = serde_yaml::from_str(&yaml_content)?;
+
+    println!(
+        "{}",
+        format!("Running benchmark: {}", benchmark.name)
+            .green()
+            .bold()
+    );
+    println!(
+        "Model: {} | Temperature: {} | Seed: {}",
+        args.model.cyan(),
+        benchmark.temperature.to_string().cyan(),
+        benchmark
+            .seed
+            .map(|s| s.to_string())
+            .unwrap_or("None".to_string())
+            .cyan()
+    );
+    println!("Endpoint: {}", args.endpoint.cyan());
+    println!("Prompts: {}", benchmark.prompts.len());
+    println!();
+
+    let config = SessionConfig {
+        system_prompt: None,
+        temperature: benchmark.temperature,
+        seed: benchmark.seed,
+    };
+
+    let mut all_metrics = Vec::new();
+    let mut messages = Vec::new();
+
+    // Start system metrics monitoring
+    let mut metrics_monitor = MetricsMonitor::new().ok();
+    if let Some(ref mut monitor) = metrics_monitor {
+        if let Err(e) = monitor.start() {
+            eprintln!("{}", format!("Warning: Failed to start metrics monitoring: {}", e).yellow());
+            metrics_monitor = None;
+        }
+    }
+
+    for (idx, prompt) in benchmark.prompts.iter().enumerate() {
+        println!(
+            "{}",
+            format!("Prompt {}: \"{}\"", idx + 1, prompt)
+                .yellow()
+                .bold()
+        );
+        println!("{}", "━".repeat(80).dimmed());
+
+        if let Some(metrics) = handle_prompt(prompt.clone(), &mut messages, args, &config).await? {
+            all_metrics.push(metrics);
+        }
+
+        println!();
+    }
+
+    // Stop system metrics monitoring and get stats
+    let system_metrics = if let Some(mut monitor) = metrics_monitor {
+        match monitor.stop() {
+            Ok(stats) => Some(stats),
+            Err(e) => {
+                eprintln!("{}", format!("Warning: Failed to collect system metrics: {}", e).yellow());
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Calculate summary statistics
+    let summary = calculate_summary(&all_metrics);
+
+    // Display results
+    display_benchmark_results(&all_metrics, &summary, &system_metrics);
+
+    // Save to JSON if requested
+    if let Some(output_file) = &args.benchmark_output {
+        let results = BenchmarkResults {
+            name: benchmark.name,
+            model: args.model.clone(),
+            endpoint: args.endpoint.clone(),
+            temperature: benchmark.temperature,
+            seed: benchmark.seed,
+            timestamp: Utc::now().to_rfc3339(),
+            prompts: all_metrics,
+            summary,
+            system_metrics,
+        };
+        fs::write(output_file, serde_json::to_string_pretty(&results)?)?;
+        println!();
+        println!(
+            "{}",
+            format!("Results saved to: {}", output_file.display()).green()
+        );
+    }
+
     Ok(())
+}
+
+fn calculate_summary(metrics: &[PromptMetrics]) -> BenchmarkSummary {
+    let total_prompts = metrics.len();
+    let total_time: f64 = metrics.iter().map(|m| m.total_time.as_secs_f64()).sum();
+    let total_tokens: usize = metrics.iter().map(|m| m.tokens).sum();
+
+    let ttfts: Vec<f64> = metrics.iter().map(|m| m.ttft.as_secs_f64()).collect();
+    let speeds: Vec<f64> = metrics.iter().map(|m| m.speed).collect();
+
+    BenchmarkSummary {
+        total_prompts,
+        total_time,
+        total_tokens,
+        ttft_avg: calculate_mean(&ttfts),
+        ttft_median: calculate_median(&ttfts),
+        ttft_min: ttfts.iter().cloned().fold(f64::INFINITY, f64::min),
+        ttft_max: ttfts.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        ttft_stddev: calculate_stddev(&ttfts),
+        speed_avg: calculate_mean(&speeds),
+        speed_median: calculate_median(&speeds),
+        speed_min: speeds.iter().cloned().fold(f64::INFINITY, f64::min),
+        speed_max: speeds.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        speed_stddev: calculate_stddev(&speeds),
+    }
+}
+
+fn calculate_mean(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.iter().sum::<f64>() / values.len() as f64
+}
+
+fn calculate_median(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mid = sorted.len() / 2;
+    if sorted.len().is_multiple_of(2) {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    } else {
+        sorted[mid]
+    }
+}
+
+fn calculate_stddev(values: &[f64]) -> f64 {
+    if values.len() <= 1 {
+        return 0.0;
+    }
+    let mean = calculate_mean(values);
+    let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
+    variance.sqrt()
+}
+
+fn display_benchmark_results(metrics: &[PromptMetrics], summary: &BenchmarkSummary, system_metrics: &Option<SystemMetricsStats>) {
+    println!("{}", "━".repeat(80).green());
+    println!("{}", "PER-PROMPT RESULTS".green().bold());
+    println!("{}", "━".repeat(80).green());
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_header(vec!["#", "TTFT", "Time", "Tokens", "Speed", "Len", "Hash"]);
+
+    for (idx, m) in metrics.iter().enumerate() {
+        table.add_row(vec![
+            format!("{}", idx + 1),
+            format!("{:.2}s", m.ttft.as_secs_f64()),
+            format!("{:.2}s", m.total_time.as_secs_f64()),
+            format!("{}", m.tokens),
+            format!("{:.1} t/s", m.speed),
+            format!("{}", m.response_length),
+            format!("{:.8}", m.response_hash),
+        ]);
+    }
+
+    println!("{}", table);
+    println!();
+
+    println!("{}", "━".repeat(80).green());
+    println!("{}", "BENCHMARK SUMMARY".green().bold());
+    println!("{}", "━".repeat(80).green());
+    println!("  Prompts:      {}", summary.total_prompts);
+    println!("  Total Time:   {:.2}s", summary.total_time);
+    println!("  Total Tokens: {}", summary.total_tokens);
+    println!();
+    println!("{}", "  TTFT (Time to First Token):".cyan().bold());
+    println!(
+        "    Avg: {:.2}s | Median: {:.2}s | Min: {:.2}s | Max: {:.2}s | StdDev: {:.3}s",
+        summary.ttft_avg,
+        summary.ttft_median,
+        summary.ttft_min,
+        summary.ttft_max,
+        summary.ttft_stddev
+    );
+    println!();
+    println!("{}", "  Speed (tokens/sec):".cyan().bold());
+    println!(
+        "    Avg: {:.1} t/s | Median: {:.1} t/s | Min: {:.1} t/s | Max: {:.1} t/s | StdDev: {:.2} t/s",
+        summary.speed_avg, summary.speed_median, summary.speed_min, summary.speed_max, summary.speed_stddev
+    );
+    println!("{}", "━".repeat(80).green());
+
+    // Display system metrics if available
+    if let Some(sm) = system_metrics {
+        println!();
+        println!("{}", "━".repeat(80).green());
+        println!("{}", "SYSTEM METRICS".green().bold());
+        println!("{}", "━".repeat(80).green());
+        println!("  Samples: {} (~{:.1}s)", sm.sample_count, sm.duration_seconds);
+        println!();
+
+        println!("{}", "  Efficiency Cores:".cyan().bold());
+        println!(
+            "    Freq (MHz):  Min: {:.0} | Mean: {:.0} | Median: {:.0} | Max: {:.0}",
+            sm.efficiency_cores.freq_mhz_min,
+            sm.efficiency_cores.freq_mhz_mean,
+            sm.efficiency_cores.freq_mhz_median,
+            sm.efficiency_cores.freq_mhz_max
+        );
+        println!(
+            "    Usage (%):   Min: {:.1} | Mean: {:.1} | Median: {:.1} | Max: {:.1}",
+            sm.efficiency_cores.usage_percent_min,
+            sm.efficiency_cores.usage_percent_mean,
+            sm.efficiency_cores.usage_percent_median,
+            sm.efficiency_cores.usage_percent_max
+        );
+        println!();
+
+        println!("{}", "  Performance Cores:".cyan().bold());
+        println!(
+            "    Freq (MHz):  Min: {:.0} | Mean: {:.0} | Median: {:.0} | Max: {:.0}",
+            sm.performance_cores.freq_mhz_min,
+            sm.performance_cores.freq_mhz_mean,
+            sm.performance_cores.freq_mhz_median,
+            sm.performance_cores.freq_mhz_max
+        );
+        println!(
+            "    Usage (%):   Min: {:.1} | Mean: {:.1} | Median: {:.1} | Max: {:.1}",
+            sm.performance_cores.usage_percent_min,
+            sm.performance_cores.usage_percent_mean,
+            sm.performance_cores.usage_percent_median,
+            sm.performance_cores.usage_percent_max
+        );
+        println!();
+
+        println!("{}", "  GPU:".cyan().bold());
+        println!(
+            "    Freq (MHz):  Min: {:.0} | Mean: {:.0} | Median: {:.0} | Max: {:.0}",
+            sm.gpu.freq_mhz_min,
+            sm.gpu.freq_mhz_mean,
+            sm.gpu.freq_mhz_median,
+            sm.gpu.freq_mhz_max
+        );
+        println!(
+            "    Usage (%):   Min: {:.1} | Mean: {:.1} | Median: {:.1} | Max: {:.1}",
+            sm.gpu.usage_percent_min,
+            sm.gpu.usage_percent_mean,
+            sm.gpu.usage_percent_median,
+            sm.gpu.usage_percent_max
+        );
+        println!();
+
+        println!("{}", "  Memory:".cyan().bold());
+        println!(
+            "    RAM (GB):    Min: {:.2} | Mean: {:.2} | Median: {:.2} | Max: {:.2}",
+            sm.memory.ram_usage_gb_min,
+            sm.memory.ram_usage_gb_mean,
+            sm.memory.ram_usage_gb_median,
+            sm.memory.ram_usage_gb_max
+        );
+        println!(
+            "    Swap (GB):   Min: {:.2} | Mean: {:.2} | Median: {:.2} | Max: {:.2}",
+            sm.memory.swap_usage_gb_min,
+            sm.memory.swap_usage_gb_mean,
+            sm.memory.swap_usage_gb_median,
+            sm.memory.swap_usage_gb_max
+        );
+        println!();
+
+        println!("{}", "  Power Consumption:".cyan().bold());
+        println!(
+            "    CPU (W):     Min: {:.2} | Mean: {:.2} | Median: {:.2} | Max: {:.2} | Total: {:.2} Wh",
+            sm.power.cpu_watts_min,
+            sm.power.cpu_watts_mean,
+            sm.power.cpu_watts_median,
+            sm.power.cpu_watts_max,
+            sm.power.cpu_watts_total / 3600.0
+        );
+        println!(
+            "    GPU (W):     Min: {:.2} | Mean: {:.2} | Median: {:.2} | Max: {:.2} | Total: {:.2} Wh",
+            sm.power.gpu_watts_min,
+            sm.power.gpu_watts_mean,
+            sm.power.gpu_watts_median,
+            sm.power.gpu_watts_max,
+            sm.power.gpu_watts_total / 3600.0
+        );
+        println!(
+            "    ANE (W):     Min: {:.2} | Mean: {:.2} | Median: {:.2} | Max: {:.2} | Total: {:.2} Wh",
+            sm.power.ane_watts_min,
+            sm.power.ane_watts_mean,
+            sm.power.ane_watts_median,
+            sm.power.ane_watts_max,
+            sm.power.ane_watts_total / 3600.0
+        );
+        println!("{}", "━".repeat(80).green());
+    }
 }
