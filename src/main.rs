@@ -83,6 +83,7 @@ struct SessionConfig {
     system_prompt: Option<String>,
     temperature: f32,
     seed: Option<i64>,
+    last_actual_total_tokens: Option<usize>,
 }
 
 impl SessionConfig {
@@ -91,6 +92,7 @@ impl SessionConfig {
             system_prompt: None,
             temperature,
             seed,
+            last_actual_total_tokens: None,
         }
     }
 }
@@ -380,6 +382,12 @@ async fn main() -> Result<()> {
                 println!();
                 let (_metrics, actual_total) =
                     handle_prompt(input.to_string(), &mut messages, &args, &config).await?;
+
+                // Update last known actual token count
+                if actual_total.is_some() {
+                    config.last_actual_total_tokens = actual_total;
+                }
+
                 check_context_usage(
                     &messages,
                     args.max_tokens,
@@ -660,6 +668,7 @@ async fn handle_command(
         "/exit" => return Ok(true),
         "/clear" => {
             messages.clear();
+            config.last_actual_total_tokens = None;
             println!("Session cleared.");
         }
         "/edit" => {
@@ -737,17 +746,30 @@ async fn handle_command(
             println!("{}", "Session Information:".green().bold());
             println!("  Messages:    {}", messages.len());
 
-            let estimated = estimate_tokens(messages, &config.system_prompt);
-            let percentage = (estimated as f64 / max_tokens as f64) * 100.0;
-            println!(
-                "  {}",
-                format!(
-                    "Tokens (ESTIMATE): ~{} / {} ({:.1}%)",
-                    estimated, max_tokens, percentage
-                )
-                .yellow()
-            );
-            println!("  {}", "└─ Based on ~4 chars/token".dimmed());
+            if let Some(actual) = config.last_actual_total_tokens {
+                let percentage = (actual as f64 / max_tokens as f64) * 100.0;
+                println!(
+                    "  {}",
+                    format!(
+                        "Tokens (ACTUAL): {} / {} ({:.1}%)",
+                        actual, max_tokens, percentage
+                    )
+                    .cyan()
+                );
+                println!("  {}", "└─ From last API response".dimmed());
+            } else {
+                let estimated = estimate_tokens(messages, &config.system_prompt);
+                let percentage = (estimated as f64 / max_tokens as f64) * 100.0;
+                println!(
+                    "  {}",
+                    format!(
+                        "Tokens (ESTIMATE): ~{} / {} ({:.1}%)",
+                        estimated, max_tokens, percentage
+                    )
+                    .yellow()
+                );
+                println!("  {}", "└─ Based on ~4 chars/token".dimmed());
+            }
         }
         _ => println!("Unknown command. Type /help for available commands."),
     }
@@ -796,6 +818,9 @@ async fn handle_prompt(
         "model": args.model,
         "messages": payload_msgs,
         "stream": true,
+        "stream_options": {
+            "include_usage": true
+        },
         "temperature": config.temperature
     });
 
@@ -844,6 +869,7 @@ async fn handle_prompt(
     let mut assistant_reply = String::new();
     let mut received_any_data = false;
     let mut md_streamer = MarkdownStreamer::new();
+    let mut actual_token_count: Option<usize> = None;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
@@ -856,6 +882,13 @@ async fn handle_prompt(
                     break;
                 }
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+                    // Check for usage information
+                    if let Some(usage) = v.get("usage") {
+                        if let Some(total) = usage["total_tokens"].as_u64() {
+                            actual_token_count = Some(total as usize);
+                        }
+                    }
+
                     if let Some(token) = v["choices"][0]["delta"]["content"].as_str() {
                         // Clear spinner on first token
                         if first_token_time.is_none() {
@@ -898,18 +931,26 @@ async fn handle_prompt(
     let total_time = start_time.elapsed();
     let ttft = first_token_time.map(|t| t.duration_since(start_time));
 
+    // Use actual token count if available, otherwise use chunk count
+    let final_token_count = actual_token_count.unwrap_or(token_count);
+    let tokens_are_actual = actual_token_count.is_some();
+
     // Print statistics
     let mut stats = Vec::new();
     if let Some(ttft_duration) = ttft {
         stats.push(format!("TTFT: {:.2}s", ttft_duration.as_secs_f64()));
     }
     stats.push(format!("Total: {:.2}s", total_time.as_secs_f64()));
-    stats.push(format!("Tokens: {}", token_count));
+    if tokens_are_actual {
+        stats.push(format!("Tokens: {}", final_token_count));
+    } else {
+        stats.push(format!("Tokens: ~{}", final_token_count));
+    }
 
     if let Some(ttft_duration) = ttft {
         let generation_time = total_time.as_secs_f64() - ttft_duration.as_secs_f64();
-        if generation_time > 0.0 && token_count > 0 {
-            let tps = token_count as f64 / generation_time;
+        if generation_time > 0.0 && final_token_count > 0 {
+            let tps = final_token_count as f64 / generation_time;
             stats.push(format!("Speed: {:.1} tok/s", tps));
         }
     }
@@ -925,12 +966,12 @@ async fn handle_prompt(
         prompt: messages.last().unwrap().content.clone(),
         ttft: ttft_duration,
         total_time,
-        tokens: token_count,
-        tokens_actual: false,
+        tokens: final_token_count,
+        tokens_actual: tokens_are_actual,
         speed: if let Some(ttft_duration) = ttft {
             let generation_time = total_time.as_secs_f64() - ttft_duration.as_secs_f64();
-            if generation_time > 0.0 && token_count > 0 {
-                token_count as f64 / generation_time
+            if generation_time > 0.0 && final_token_count > 0 {
+                final_token_count as f64 / generation_time
             } else {
                 0.0
             }
@@ -946,7 +987,7 @@ async fn handle_prompt(
         content: assistant_reply,
     });
 
-    Ok((metrics, None))
+    Ok((metrics, actual_token_count))
 }
 
 async fn run_benchmark(benchmark_file: &PathBuf, args: &Args) -> Result<()> {
@@ -977,6 +1018,7 @@ async fn run_benchmark(benchmark_file: &PathBuf, args: &Args) -> Result<()> {
         system_prompt: None,
         temperature: benchmark.temperature,
         seed: benchmark.seed,
+        last_actual_total_tokens: None,
     };
 
     let mut all_metrics = Vec::new();
