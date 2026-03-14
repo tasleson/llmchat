@@ -1,0 +1,8 @@
+name: "Model Performance Test"
+temperature: 0
+seed: 42
+prompts:
+  - "What is Rust?"
+  - "Explain async/await in 2 sentences"
+  - "Write a hello world in Python"
+  - "What are the benefits of static typing?"
