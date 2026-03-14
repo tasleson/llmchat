@@ -51,6 +51,30 @@ struct Args {
     /// Use internal multiline editor instead of external $EDITOR
     #[arg(long, default_value = "false")]
     internal_editor: bool,
+
+    /// Temperature for response randomness (0.0-2.0, lower = more deterministic)
+    #[arg(long, default_value = "1.0")]
+    temperature: f32,
+
+    /// Seed for reproducible outputs
+    #[arg(long)]
+    seed: Option<i64>,
+}
+
+struct SessionConfig {
+    system_prompt: Option<String>,
+    temperature: f32,
+    seed: Option<i64>,
+}
+
+impl SessionConfig {
+    fn new(temperature: f32, seed: Option<i64>) -> Self {
+        Self {
+            system_prompt: None,
+            temperature,
+            seed,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -221,11 +245,11 @@ impl MarkdownStreamer {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let mut messages = load_session(&args.session)?;
-    let mut system_prompt: Option<String> = None;
+    let mut config = SessionConfig::new(args.temperature, args.seed);
 
     // --- One-shot from CLI argument ---
     if let Some(ref p) = args.prompt {
-        handle_prompt(p.clone(), &mut messages, &args, &system_prompt).await?;
+        handle_prompt(p.clone(), &mut messages, &args, &config).await?;
         save_session(&args.session, &messages)?;
         return Ok(());
     }
@@ -234,7 +258,7 @@ async fn main() -> Result<()> {
     if !atty::is(atty::Stream::Stdin) {
         let mut input = String::new();
         io::stdin().read_to_string(&mut input)?;
-        handle_prompt(input, &mut messages, &args, &system_prompt).await?;
+        handle_prompt(input, &mut messages, &args, &config).await?;
         save_session(&args.session, &messages)?;
         return Ok(());
     }
@@ -255,7 +279,7 @@ async fn main() -> Result<()> {
                 rl.add_history_entry(input)?;
 
                 if input.starts_with('/') {
-                    if handle_command(input, &mut messages, &mut system_prompt, &args).await? {
+                    if handle_command(input, &mut messages, &mut config, &args).await? {
                         break;
                     }
                     save_session(&args.session, &messages)?;
@@ -263,7 +287,7 @@ async fn main() -> Result<()> {
                 }
                 // Lets add a newline to create a clearer boundary between request and response
                 println!();
-                handle_prompt(input.to_string(), &mut messages, &args, &system_prompt).await?;
+                handle_prompt(input.to_string(), &mut messages, &args, &config).await?;
                 save_session(&args.session, &messages)?;
             }
             Err(_) => break,
@@ -370,10 +394,10 @@ fn create_spinner(message: &str) -> ProgressBar {
 async fn handle_command(
     cmd: &str,
     messages: &mut Vec<Message>,
-    system_prompt: &mut Option<String>,
+    config: &mut SessionConfig,
     args: &Args,
 ) -> Result<bool> {
-    const HELP_WIDTH: usize = 16;
+    const HELP_WIDTH: usize = 20;
     let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
 
     match parts[0] {
@@ -407,6 +431,36 @@ async fn handle_command(
                 width = HELP_WIDTH
             );
             println!(
+                "  {:<width$}  Set temperature (0.0-2.0, lower = more deterministic)",
+                "/temperature <value>".cyan(),
+                width = HELP_WIDTH
+            );
+            println!(
+                "  {:<width$}  Example: /temperature 0.7",
+                "".dimmed(),
+                width = HELP_WIDTH
+            );
+            println!(
+                "  {:<width$}  Set seed for reproducible outputs",
+                "/seed <value>".cyan(),
+                width = HELP_WIDTH
+            );
+            println!(
+                "  {:<width$}  Example: /seed 42",
+                "".dimmed(),
+                width = HELP_WIDTH
+            );
+            println!(
+                "  {:<width$}  Clear the seed (use random generation)",
+                "/seed clear".cyan(),
+                width = HELP_WIDTH
+            );
+            println!(
+                "  {:<width$}  Show current configuration",
+                "/config".cyan(),
+                width = HELP_WIDTH
+            );
+            println!(
                 "  {:<width$}  Show this help message",
                 "/help".cyan(),
                 width = HELP_WIDTH
@@ -427,12 +481,67 @@ async fn handle_command(
             // Lets output the prompt, so that the user can see exactly what they sent to the
             // model
             println!("{content}");
-            handle_prompt(content, messages, args, system_prompt).await?;
+            handle_prompt(content, messages, args, config).await?;
         }
         "/system" => {
             if parts.len() > 1 {
-                *system_prompt = Some(parts[1].to_string());
+                config.system_prompt = Some(parts[1].to_string());
                 println!("System prompt set.");
+            } else {
+                println!("Usage: /system <prompt>");
+            }
+        }
+        "/temperature" => {
+            if parts.len() > 1 {
+                match parts[1].parse::<f32>() {
+                    Ok(temp) if (0.0..=2.0).contains(&temp) => {
+                        config.temperature = temp;
+                        println!("Temperature set to: {}", temp);
+                    }
+                    Ok(_) => println!("Temperature must be between 0.0 and 2.0"),
+                    Err(_) => {
+                        println!("Invalid temperature value. Use a number between 0.0 and 2.0")
+                    }
+                }
+            } else {
+                println!("Current temperature: {}", config.temperature);
+                println!("Usage: /temperature <value>");
+            }
+        }
+        "/seed" => {
+            if parts.len() > 1 {
+                if parts[1] == "clear" {
+                    config.seed = None;
+                    println!("Seed cleared (using random generation).");
+                } else {
+                    match parts[1].parse::<i64>() {
+                        Ok(seed_val) => {
+                            config.seed = Some(seed_val);
+                            println!("Seed set to: {}", seed_val);
+                        }
+                        Err(_) => println!("Invalid seed value. Use an integer or 'clear'."),
+                    }
+                }
+            } else {
+                match config.seed {
+                    Some(s) => println!("Current seed: {}", s),
+                    None => println!("Current seed: None (random generation)"),
+                }
+                println!("Usage: /seed <value> or /seed clear");
+            }
+        }
+        "/config" => {
+            println!("{}", "Current Configuration:".green().bold());
+            println!("  Model:       {}", args.model.cyan());
+            println!("  Endpoint:    {}", args.endpoint.cyan());
+            println!("  Temperature: {}", config.temperature.to_string().cyan());
+            match config.seed {
+                Some(s) => println!("  Seed:        {}", s.to_string().cyan()),
+                None => println!("  Seed:        {}", "None (random)".dimmed()),
+            }
+            match &config.system_prompt {
+                Some(sp) => println!("  System:      {}", sp.cyan()),
+                None => println!("  System:      {}", "None".dimmed()),
             }
         }
         _ => println!("Unknown command. Type /help for available commands."),
@@ -445,7 +554,7 @@ async fn handle_prompt(
     input: String,
     messages: &mut Vec<Message>,
     args: &Args,
-    system_prompt: &Option<String>,
+    config: &SessionConfig,
 ) -> Result<()> {
     let trimmed = input.trim().to_string();
 
@@ -461,7 +570,7 @@ async fn handle_prompt(
 
     let mut payload_msgs = vec![];
 
-    if let Some(sys) = system_prompt {
+    if let Some(sys) = &config.system_prompt {
         payload_msgs.push(json!({ "role": "system", "content": sys }));
     }
 
@@ -478,15 +587,18 @@ async fn handle_prompt(
     let mut first_token_time: Option<Instant> = None;
     let mut token_count = 0;
 
-    let response = client
-        .post(&url)
-        .json(&json!({
-            "model": args.model,
-            "messages": payload_msgs,
-            "stream": true
-        }))
-        .send()
-        .await;
+    let mut request_body = json!({
+        "model": args.model,
+        "messages": payload_msgs,
+        "stream": true,
+        "temperature": config.temperature
+    });
+
+    if let Some(seed_value) = config.seed {
+        request_body["seed"] = json!(seed_value);
+    }
+
+    let response = client.post(&url).json(&request_body).send().await;
 
     let response = match response {
         Ok(r) => r,
