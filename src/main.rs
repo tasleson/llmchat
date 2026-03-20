@@ -11,6 +11,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures_util::StreamExt;
+use gio::prelude::SettingsExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use ratatui::{
     backend::CrosstermBackend,
@@ -156,6 +157,62 @@ struct Message {
     content: String,
 }
 
+enum ColorScheme {
+    Light,
+    Dark,
+}
+
+// Try to get terminal color scheme. Some people may have dark terminal theme
+// even though their system theme is light.
+fn terminal_scheme() -> Result<ColorScheme> {
+    termbg::theme(Duration::from_millis(100))
+        .map(|theme| match theme {
+            termbg::Theme::Dark => ColorScheme::Dark,
+            termbg::Theme::Light => ColorScheme::Light,
+        })
+        .map_err(|e| e.into())
+}
+
+#[cfg(target_os = "macos")]
+fn color_scheme() -> ColorScheme {
+    if let Ok(scheme) = terminal_scheme() {
+        return scheme;
+    }
+
+    if let Ok(output) = Command::new("defaults")
+        .args(&["read", "-g", "AppleInterfaceStyle"])
+        .output()
+    {
+        if output.status.success() {
+            let scheme = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .to_lowercase();
+            if scheme == "dark" {
+                return ColorScheme::Dark;
+            }
+        }
+    }
+
+    ColorScheme::Light
+}
+
+#[cfg(target_os = "linux")]
+fn color_scheme() -> ColorScheme {
+    if let Ok(scheme) = terminal_scheme() {
+        return scheme;
+    }
+
+    // Try to detect GNOME color scheme as a fallback (works for many Linux
+    // distros)
+    let settings = gio::Settings::new("org.gnome.desktop.interface");
+    let scheme: String = settings.string("color-scheme").to_string();
+    if scheme.contains("dark") {
+        ColorScheme::Dark
+    } else {
+        ColorScheme::Light
+    }
+}
+
 /// State machine for streaming markdown rendering
 struct MarkdownStreamer {
     buffer: String,
@@ -164,6 +221,7 @@ struct MarkdownStreamer {
     code_buffer: String,
     syntax_set: SyntaxSet,
     theme_set: ThemeSet,
+    color_scheme: ColorScheme,
 }
 
 impl MarkdownStreamer {
@@ -175,6 +233,7 @@ impl MarkdownStreamer {
             code_buffer: String::new(),
             syntax_set: SyntaxSet::load_defaults_newlines(),
             theme_set: ThemeSet::load_defaults(),
+            color_scheme: color_scheme(),
         }
     }
 
@@ -269,7 +328,11 @@ impl MarkdownStreamer {
             result = self.highlight_inline_code(line);
         }
 
-        print!("{}", result.black());
+        match self.color_scheme {
+            ColorScheme::Dark => print!("{}", result.white()),
+            ColorScheme::Light => print!("{}", result.black()),
+        }
+
         io::stdout().flush()
     }
 
