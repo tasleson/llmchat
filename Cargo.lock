@@ -1136,6 +1136,7 @@ dependencies = [
 [[package]]
 name = "macmon"
 version = "0.6.1"
+source = "git+https://github.com/tasleson/macmon.git?branch=num_proc_fix#f1dc584d0cf476f773d80056007f3558984229a4"
 dependencies = [
  "chrono",
  "clap",
