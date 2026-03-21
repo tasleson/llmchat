@@ -81,6 +81,10 @@ struct Args {
     /// Maximum context window size in tokens (auto-detected from model if available)
     #[arg(long, default_value = "8192")]
     max_tokens: usize,
+
+    /// Display version information
+    #[arg(long)]
+    version: bool,
 }
 
 struct SessionConfig {
@@ -384,6 +388,20 @@ impl MarkdownStreamer {
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = Args::parse();
+
+    // Handle --version flag
+    if args.version {
+        const VERSION: &str = env!("CARGO_PKG_VERSION");
+        const GIT_SHA: &str = env!("GIT_SHA");
+        const GIT_BRANCH: &str = env!("GIT_BRANCH");
+        const GIT_DIRTY: &str = env!("GIT_DIRTY");
+
+        println!("llmchat     {}", VERSION);
+        println!("Git SHA:    {}", GIT_SHA);
+        println!("Git Branch: {}", GIT_BRANCH);
+        println!("Git Dirty:  {}", GIT_DIRTY);
+        return Ok(());
+    }
 
     // Try to auto-detect context window from model info
     if let Some(detected_context) = fetch_model_context_window(&args.endpoint, &args.model).await {
