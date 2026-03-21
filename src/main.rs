@@ -11,7 +11,10 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures_util::StreamExt;
+
+#[cfg(target_os = "linux")]
 use gio::prelude::SettingsExt;
+
 use indicatif::{ProgressBar, ProgressStyle};
 use ratatui::{
     backend::CrosstermBackend,
@@ -180,7 +183,7 @@ fn color_scheme() -> ColorScheme {
     }
 
     if let Ok(output) = Command::new("defaults")
-        .args(&["read", "-g", "AppleInterfaceStyle"])
+        .args(["read", "-g", "AppleInterfaceStyle"])
         .output()
     {
         if output.status.success() {
