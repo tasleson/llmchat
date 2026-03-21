@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "macmon"))]
 use std::sync::{Arc, Mutex};
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "macmon"))]
 use std::thread;
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "macmon"))]
 use macmon::{Metrics, Sampler, SocInfo};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,7 +77,7 @@ pub struct HardwareInfo {
     pub gpu_freqs: Vec<u32>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "macmon"))]
 impl From<&SocInfo> for HardwareInfo {
     fn from(soc: &SocInfo) -> Self {
         HardwareInfo {
@@ -94,7 +94,7 @@ impl From<&SocInfo> for HardwareInfo {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "macmon"))]
 pub struct MetricsMonitor {
     samples: Arc<Mutex<Vec<Metrics>>>,
     running: Arc<Mutex<bool>>,
@@ -102,7 +102,7 @@ pub struct MetricsMonitor {
     soc_info: Option<SocInfo>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "macmon"))]
 impl MetricsMonitor {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
@@ -169,10 +169,10 @@ impl MetricsMonitor {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(all(target_os = "macos", feature = "macmon")))]
 pub struct MetricsMonitor;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(all(target_os = "macos", feature = "macmon")))]
 impl MetricsMonitor {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self)
@@ -187,7 +187,7 @@ impl MetricsMonitor {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "macmon"))]
 fn calculate_stats(samples: &[Metrics]) -> SystemMetricsStats {
     if samples.is_empty() {
         return SystemMetricsStats {
@@ -332,7 +332,7 @@ fn calculate_stats(samples: &[Metrics]) -> SystemMetricsStats {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "macmon"))]
 fn median_u32(values: &[u32]) -> f32 {
     if values.is_empty() {
         return 0.0;
@@ -345,7 +345,7 @@ fn median_u32(values: &[u32]) -> f32 {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "macmon"))]
 fn median_f32(values: &[f32]) -> f32 {
     if values.is_empty() {
         return 0.0;
@@ -358,7 +358,7 @@ fn median_f32(values: &[f32]) -> f32 {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "macmon"))]
 fn mean_f32(values: &[f32]) -> f32 {
     if values.is_empty() {
         return 0.0;
@@ -366,12 +366,12 @@ fn mean_f32(values: &[f32]) -> f32 {
     values.iter().sum::<f32>() / values.len() as f32
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "macmon"))]
 fn min_f32(values: &[f32]) -> f32 {
     values.iter().cloned().fold(f32::INFINITY, f32::min)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "macmon"))]
 fn max_f32(values: &[f32]) -> f32 {
     values.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
 }
