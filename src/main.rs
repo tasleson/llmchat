@@ -49,11 +49,11 @@ struct Args {
     #[arg(short, long)]
     session: Option<PathBuf>,
 
-    #[arg(short, long, default_value = "local-model")]
-    model: String,
+    #[arg(short, long)]
+    model: Option<String>,
 
-    #[arg(long, default_value = "http://localhost:1234/v1")]
-    endpoint: String,
+    #[arg(long)]
+    endpoint: Option<String>,
 
     /// Optional one-shot prompt
     prompt: Option<String>,
@@ -63,8 +63,8 @@ struct Args {
     internal_editor: bool,
 
     /// Temperature for response randomness (0.0-2.0, lower = more deterministic)
-    #[arg(long, default_value = "1.0")]
-    temperature: f32,
+    #[arg(long)]
+    temperature: Option<f32>,
 
     /// Seed for reproducible outputs
     #[arg(long)]
@@ -79,8 +79,8 @@ struct Args {
     benchmark_output: Option<PathBuf>,
 
     /// Maximum context window size in tokens (auto-detected from model if available)
-    #[arg(long, default_value = "8192")]
-    max_tokens: usize,
+    #[arg(long)]
+    max_tokens: Option<usize>,
 
     /// Display version information
     #[arg(long)]
@@ -88,6 +88,8 @@ struct Args {
 }
 
 struct SessionConfig {
+    endpoint: String,
+    model: String,
     system_prompt: Option<String>,
     temperature: f32,
     seed: Option<i64>,
@@ -95,14 +97,78 @@ struct SessionConfig {
 }
 
 impl SessionConfig {
-    fn new(temperature: f32, seed: Option<i64>) -> Self {
+    fn new(endpoint: String, model: String, temperature: f32, seed: Option<i64>) -> Self {
         Self {
+            endpoint,
+            model,
             system_prompt: None,
             temperature,
             seed,
             last_actual_total_tokens: None,
         }
     }
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct AppConfig {
+    // Optional server address, e.g. http://localhost:1234/v1
+    #[serde(skip_serializing_if = "Option::is_none")]
+    endpoint: Option<String>,
+    // Optional model identifier
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    // Optional temperature (0.0-2.0, lower = more deterministic)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    // Optional seed for reproducible outputs
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<i64>,
+    // Optional maximum context window size in tokens
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<usize>,
+}
+
+// Config file lives in XDG config dir: $XDG_CONFIG_HOME/llmchat/config.yaml,
+// falling back to ~/.config/llmchat/config.yaml
+fn config_path() -> PathBuf {
+    if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("llmchat").join("config.yaml");
+        }
+    }
+    match env::var_os("HOME") {
+        Some(home) if !home.is_empty() => {
+            PathBuf::from(home).join(".config/llmchat/config.yaml")
+        }
+        _ => PathBuf::from(".config/llmchat/config.yaml"),
+    }
+}
+
+fn load_config() -> AppConfig {
+    let path = config_path();
+    match fs::read_to_string(&path) {
+        Ok(data) => match serde_yaml::from_str(&data) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!(
+                    "{}",
+                    format!("Warning: Failed to parse config {}: {}", path.display(), e).yellow()
+                );
+                AppConfig::default()
+            }
+        },
+        Err(_) => AppConfig::default(),
+    }
+}
+
+fn save_config(cfg: &AppConfig) -> Result<()> {
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let data = serde_yaml::to_string(cfg)?;
+    fs::write(&path, data)?;
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -403,15 +469,32 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Load config file (if any) and apply precedence:
+    // CLI flag > config file > built-in default.
+    let app_config = load_config();
+    args.endpoint = args
+        .endpoint
+        .or(app_config.endpoint)
+        .or_else(|| Some("http://localhost:1234/v1".to_string()));
+    args.model = args
+        .model
+        .or(app_config.model)
+        .or_else(|| Some("local-model".to_string()));
+    args.temperature = args.temperature.or(app_config.temperature).or(Some(1.0));
+    args.seed = args.seed.or(app_config.seed);
+    args.max_tokens = args.max_tokens.or(app_config.max_tokens).or(Some(8192));
+
     // Try to auto-detect context window from model info
-    if let Some(detected_context) = fetch_model_context_window(&args.endpoint, &args.model).await {
-        if args.max_tokens == 8192 {
-            // Only override if using default value
-            args.max_tokens = detected_context;
-            eprintln!(
-                "{}",
-                format!("Auto-detected context window: {} tokens", detected_context).dimmed()
-            );
+    if let (Some(endpoint), Some(model)) = (&args.endpoint, &args.model) {
+        if let Some(detected_context) = fetch_model_context_window(endpoint, model).await {
+            if args.max_tokens == Some(8192) {
+                // Only override if using default value
+                args.max_tokens = Some(detected_context);
+                eprintln!(
+                    "{}",
+                    format!("Auto-detected context window: {} tokens", detected_context).dimmed()
+                );
+            }
         }
     }
 
@@ -422,11 +505,16 @@ async fn main() -> Result<()> {
     }
 
     let mut messages = load_session(&args.session)?;
-    let mut config = SessionConfig::new(args.temperature, args.seed);
+    let mut config = SessionConfig::new(
+        args.endpoint.clone().unwrap_or_default(),
+        args.model.clone().unwrap_or_default(),
+        args.temperature.unwrap_or(1.0),
+        args.seed,
+    );
 
     // --- One-shot from CLI argument ---
     if let Some(ref p) = args.prompt {
-        let (_metrics, _total) = handle_prompt(p.clone(), &mut messages, &args, &config).await?;
+        let (_metrics, _total) = handle_prompt(p.clone(), &mut messages, &config).await?;
         save_session(&args.session, &messages)?;
         return Ok(());
     }
@@ -435,7 +523,7 @@ async fn main() -> Result<()> {
     if !atty::is(atty::Stream::Stdin) {
         let mut input = String::new();
         io::stdin().read_to_string(&mut input)?;
-        let (_metrics, _total) = handle_prompt(input, &mut messages, &args, &config).await?;
+        let (_metrics, _total) = handle_prompt(input, &mut messages, &config).await?;
         save_session(&args.session, &messages)?;
         return Ok(());
     }
@@ -465,7 +553,7 @@ async fn main() -> Result<()> {
                 // Lets add a newline to create a clearer boundary between request and response
                 println!();
                 let (_metrics, actual_total) =
-                    handle_prompt(input.to_string(), &mut messages, &args, &config).await?;
+                    handle_prompt(input.to_string(), &mut messages, &config).await?;
 
                 // Update last known actual token count
                 if actual_total.is_some() {
@@ -474,7 +562,7 @@ async fn main() -> Result<()> {
 
                 check_context_usage(
                     &messages,
-                    args.max_tokens,
+                    args.max_tokens.unwrap_or(8192),
                     actual_total,
                     &config.system_prompt,
                 );
@@ -734,6 +822,16 @@ async fn handle_command(
                 width = HELP_WIDTH
             );
             println!(
+                "  {:<width$}  Set endpoint for this session (no config change)",
+                "/endpoint <url>".cyan(),
+                width = HELP_WIDTH
+            );
+            println!(
+                "  {:<width$}  Set endpoint and persist it to config file",
+                "/save-endpoint <url>".cyan(),
+                width = HELP_WIDTH
+            );
+            println!(
                 "  {:<width$}  Show session info and token usage",
                 "/info".cyan(),
                 width = HELP_WIDTH
@@ -760,7 +858,7 @@ async fn handle_command(
             // Lets output the prompt, so that the user can see exactly what they sent to the
             // model
             println!("{content}");
-            let (_metrics, _total) = handle_prompt(content, messages, args, config).await?;
+            let (_metrics, _total) = handle_prompt(content, messages, config).await?;
         }
         "/system" => {
             if parts.len() > 1 {
@@ -809,11 +907,31 @@ async fn handle_command(
                 println!("Usage: /seed <value> or /seed clear");
             }
         }
+        "/endpoint" | "/save-endpoint" => {
+            let persist = parts[0] == "/save-endpoint";
+            if parts.len() > 1 {
+                config.endpoint = parts[1].trim().to_string();
+                println!("Endpoint set to: {}", config.endpoint.cyan());
+            } else {
+                println!("Current endpoint: {}", config.endpoint.cyan());
+            }
+            if persist {
+                let mut cfg = load_config();
+                cfg.endpoint = Some(config.endpoint.clone());
+                save_config(&cfg)?;
+                println!(
+                    "{}",
+                    format!("Saved endpoint to config: {}", config_path().display()).green()
+                );
+            } else if parts.len() <= 1 {
+                println!("Usage: /endpoint <url>");
+            }
+        }
         "/config" => {
             println!("{}", "Current Configuration:".green().bold());
-            println!("  Model:       {}", args.model.cyan());
-            println!("  Endpoint:    {}", args.endpoint.cyan());
-            println!("  Max tokens:  {}", args.max_tokens.to_string().cyan());
+            println!("  Model:       {}", config.model.cyan());
+            println!("  Endpoint:    {}", config.endpoint.cyan());
+            println!("  Max tokens:  {}", args.max_tokens.unwrap_or(8192).to_string().cyan());
             println!("  Temperature: {}", config.temperature.to_string().cyan());
             match config.seed {
                 Some(s) => println!("  Seed:        {}", s.to_string().cyan()),
@@ -825,7 +943,7 @@ async fn handle_command(
             }
         }
         "/info" => {
-            let max_tokens = args.max_tokens;
+            let max_tokens = args.max_tokens.unwrap_or(8192);
 
             println!("{}", "Session Information:".green().bold());
             println!("  Messages:    {}", messages.len());
@@ -864,7 +982,6 @@ async fn handle_command(
 async fn handle_prompt(
     input: String,
     messages: &mut Vec<Message>,
-    args: &Args,
     config: &SessionConfig,
 ) -> Result<(Option<PromptMetrics>, Option<usize>)> {
     let trimmed = input.trim().to_string();
@@ -890,7 +1007,7 @@ async fn handle_prompt(
     }
 
     let client = reqwest::Client::new();
-    let url = format!("{}/chat/completions", args.endpoint);
+    let url = format!("{}/chat/completions", config.endpoint);
 
     let spinner = create_spinner("Waiting for response...");
 
@@ -899,7 +1016,7 @@ async fn handle_prompt(
     let mut token_count = 0;
 
     let mut request_body = json!({
-        "model": args.model,
+        "model": config.model.clone(),
         "messages": payload_msgs,
         "stream": true,
         "stream_options": {
@@ -1086,7 +1203,7 @@ async fn run_benchmark(benchmark_file: &PathBuf, args: &Args) -> Result<()> {
     );
     println!(
         "Model: {} | Temperature: {} | Seed: {}",
-        args.model.cyan(),
+        args.model.as_deref().unwrap_or("local-model").cyan(),
         benchmark.temperature.to_string().cyan(),
         benchmark
             .seed
@@ -1094,11 +1211,13 @@ async fn run_benchmark(benchmark_file: &PathBuf, args: &Args) -> Result<()> {
             .unwrap_or("None".to_string())
             .cyan()
     );
-    println!("Endpoint: {}", args.endpoint.cyan());
+    println!("Endpoint: {}", args.endpoint.as_deref().unwrap_or("http://localhost:1234/v1").cyan());
     println!("Prompts: {}", benchmark.prompts.len());
     println!();
 
     let config = SessionConfig {
+        endpoint: args.endpoint.clone().unwrap_or_default(),
+        model: args.model.clone().unwrap_or_default(),
         system_prompt: None,
         temperature: benchmark.temperature,
         seed: benchmark.seed,
@@ -1129,7 +1248,7 @@ async fn run_benchmark(benchmark_file: &PathBuf, args: &Args) -> Result<()> {
         );
         println!("{}", "━".repeat(80).dimmed());
 
-        let (metrics, _total) = handle_prompt(prompt.clone(), &mut messages, args, &config).await?;
+        let (metrics, _total) = handle_prompt(prompt.clone(), &mut messages, &config).await?;
         if let Some(m) = metrics {
             all_metrics.push(m);
         }
@@ -1163,8 +1282,8 @@ async fn run_benchmark(benchmark_file: &PathBuf, args: &Args) -> Result<()> {
     if let Some(output_file) = &args.benchmark_output {
         let results = BenchmarkResults {
             name: benchmark.name,
-            model: args.model.clone(),
-            endpoint: args.endpoint.clone(),
+            model: args.model.clone().unwrap_or_default(),
+            endpoint: args.endpoint.clone().unwrap_or_default(),
             temperature: benchmark.temperature,
             seed: benchmark.seed,
             timestamp: Utc::now().to_rfc3339(),
