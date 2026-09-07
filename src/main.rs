@@ -49,11 +49,15 @@ struct Args {
     #[arg(short, long)]
     session: Option<PathBuf>,
 
-    #[arg(short, long, default_value = "local-model")]
-    model: String,
+    #[arg(short, long)]
+    model: Option<String>,
 
-    #[arg(long, default_value = "http://localhost:1234/v1")]
-    endpoint: String,
+    #[arg(long)]
+    endpoint: Option<String>,
+
+    /// API key for authentication (Bearer token sent as Authorization header)
+    #[arg(long)]
+    api_key: Option<String>,
 
     /// Optional one-shot prompt
     prompt: Option<String>,
@@ -63,8 +67,8 @@ struct Args {
     internal_editor: bool,
 
     /// Temperature for response randomness (0.0-2.0, lower = more deterministic)
-    #[arg(long, default_value = "1.0")]
-    temperature: f32,
+    #[arg(long)]
+    temperature: Option<f32>,
 
     /// Seed for reproducible outputs
     #[arg(long)]
@@ -79,8 +83,8 @@ struct Args {
     benchmark_output: Option<PathBuf>,
 
     /// Maximum context window size in tokens (auto-detected from model if available)
-    #[arg(long, default_value = "8192")]
-    max_tokens: usize,
+    #[arg(long)]
+    max_tokens: Option<usize>,
 
     /// Display version information
     #[arg(long)]
@@ -88,6 +92,9 @@ struct Args {
 }
 
 struct SessionConfig {
+    endpoint: String,
+    model: String,
+    api_key: Option<String>,
     system_prompt: Option<String>,
     temperature: f32,
     seed: Option<i64>,
@@ -95,14 +102,104 @@ struct SessionConfig {
 }
 
 impl SessionConfig {
-    fn new(temperature: f32, seed: Option<i64>) -> Self {
+    fn new(endpoint: String, model: String, api_key: Option<String>, temperature: f32, seed: Option<i64>) -> Self {
         Self {
+            endpoint,
+            model,
+            api_key,
             system_prompt: None,
             temperature,
             seed,
             last_actual_total_tokens: None,
         }
     }
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct AppConfig {
+    // Optional server address, e.g. http://localhost:1234/v1
+    #[serde(skip_serializing_if = "Option::is_none")]
+    endpoint: Option<String>,
+    // Optional model identifier
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    // Optional API key (Authorization: Bearer header)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key: Option<String>,
+    // Optional temperature (0.0-2.0, lower = more deterministic)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    // Optional seed for reproducible outputs
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<i64>,
+    // Optional maximum context window size in tokens
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<usize>,
+}
+
+// Config and history live in XDG config dir: $XDG_CONFIG_HOME/llmchat/,
+// falling back to ~/.config/llmchat/
+fn config_dir() -> PathBuf {
+    if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("llmchat");
+        }
+    }
+    match env::var_os("HOME") {
+        Some(home) if !home.is_empty() => PathBuf::from(home).join(".config/llmchat"),
+        _ => PathBuf::from(".config/llmchat"),
+    }
+}
+
+fn config_path() -> PathBuf {
+    config_dir().join("config.yaml")
+}
+
+fn history_path() -> PathBuf {
+    config_dir().join("history")
+}
+
+fn load_config() -> AppConfig {
+    let path = config_path();
+    match fs::read_to_string(&path) {
+        Ok(data) => match serde_yaml::from_str(&data) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!(
+                    "{}",
+                    format!("Warning: Failed to parse config {}: {}", path.display(), e).yellow()
+                );
+                AppConfig::default()
+            }
+        },
+        Err(_) => AppConfig::default(),
+    }
+}
+
+fn save_config(cfg: &AppConfig) -> Result<()> {
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let data = serde_yaml::to_string(cfg)?;
+    fs::write(&path, data)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Config may contain an API key; keep it private to the owner.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+// Show only the last 4 chars of a secret, e.g. "*…1234"
+fn mask_key(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() <= 4 {
+        return "****".to_string();
+    }
+    let (head, tail) = chars.split_at(chars.len() - 4);
+    format!("{}…{}", "*".repeat(head.len()), tail.iter().collect::<String>())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -403,14 +500,55 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Load config file (if any) and apply precedence:
+    // CLI flag > config file > built-in default.
+    let app_config = load_config();
+    args.endpoint = args
+        .endpoint
+        .or(app_config.endpoint)
+        .or_else(|| Some("http://localhost:1234/v1".to_string()));
+    args.model = args
+        .model
+        .or(app_config.model)
+        .or_else(|| Some("local-model".to_string()));
+    args.temperature = args.temperature.or(app_config.temperature).or(Some(1.0));
+    args.seed = args.seed.or(app_config.seed);
+    args.max_tokens = args.max_tokens.or(app_config.max_tokens).or(Some(8192));
+    args.api_key = args
+        .api_key
+        .or(app_config.api_key)
+        .or_else(|| env::var("LLMCHAT_API_KEY").ok());
+
     // Try to auto-detect context window from model info
-    if let Some(detected_context) = fetch_model_context_window(&args.endpoint, &args.model).await {
-        if args.max_tokens == 8192 {
-            // Only override if using default value
-            args.max_tokens = detected_context;
+    if let (Some(endpoint), Some(model)) = (&args.endpoint, &args.model) {
+        if let Some(detected_context) =
+            fetch_model_context_window(endpoint, model, args.api_key.as_deref()).await
+        {
+            if args.max_tokens == Some(8192) {
+                // Only override if using default value
+                args.max_tokens = Some(detected_context);
+                eprintln!(
+                    "{}",
+                    format!("Auto-detected context window: {} tokens", detected_context).dimmed()
+                );
+            }
+        }
+    }
+
+    // Best-effort: warn (but don't block) if the configured model isn't listed
+    // by the endpoint.
+    if let (Some(endpoint), Some(model)) = (&args.endpoint, &args.model) {
+        if validate_model(endpoint, model, args.api_key.as_deref())
+            .await
+            == Some(false)
+        {
             eprintln!(
                 "{}",
-                format!("Auto-detected context window: {} tokens", detected_context).dimmed()
+                format!(
+                    "Warning: Model '{}' is not in the endpoint's model list. Use /models to list available models.",
+                    model
+                )
+                .yellow()
             );
         }
     }
@@ -422,11 +560,17 @@ async fn main() -> Result<()> {
     }
 
     let mut messages = load_session(&args.session)?;
-    let mut config = SessionConfig::new(args.temperature, args.seed);
+    let mut config = SessionConfig::new(
+        args.endpoint.clone().unwrap_or_default(),
+        args.model.clone().unwrap_or_default(),
+        args.api_key.clone(),
+        args.temperature.unwrap_or(1.0),
+        args.seed,
+    );
 
     // --- One-shot from CLI argument ---
     if let Some(ref p) = args.prompt {
-        let (_metrics, _total) = handle_prompt(p.clone(), &mut messages, &args, &config).await?;
+        let (_metrics, _total) = handle_prompt(p.clone(), &mut messages, &config).await?;
         save_session(&args.session, &messages)?;
         return Ok(());
     }
@@ -435,13 +579,17 @@ async fn main() -> Result<()> {
     if !atty::is(atty::Stream::Stdin) {
         let mut input = String::new();
         io::stdin().read_to_string(&mut input)?;
-        let (_metrics, _total) = handle_prompt(input, &mut messages, &args, &config).await?;
+        let (_metrics, _total) = handle_prompt(input, &mut messages, &config).await?;
         save_session(&args.session, &messages)?;
         return Ok(());
     }
 
     // --- Interactive REPL ---
     let mut rl = Editor::<(), DefaultHistory>::new()?;
+    let history = history_path();
+    if history.exists() {
+        rl.load_history(&history)?;
+    }
     loop {
         let line = rl.readline(&format!("{}", "lms> ".green().bold()));
 
@@ -465,7 +613,7 @@ async fn main() -> Result<()> {
                 // Lets add a newline to create a clearer boundary between request and response
                 println!();
                 let (_metrics, actual_total) =
-                    handle_prompt(input.to_string(), &mut messages, &args, &config).await?;
+                    handle_prompt(input.to_string(), &mut messages, &config).await?;
 
                 // Update last known actual token count
                 if actual_total.is_some() {
@@ -474,7 +622,7 @@ async fn main() -> Result<()> {
 
                 check_context_usage(
                     &messages,
-                    args.max_tokens,
+                    args.max_tokens.unwrap_or(8192),
                     actual_total,
                     &config.system_prompt,
                 );
@@ -483,6 +631,11 @@ async fn main() -> Result<()> {
             Err(_) => break,
         }
     }
+
+    if let Some(parent) = history.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    rl.save_history(&history)?;
 
     Ok(())
 }
@@ -554,11 +707,20 @@ fn check_context_usage(
     }
 }
 
-async fn fetch_model_context_window(endpoint: &str, model: &str) -> Option<usize> {
+async fn fetch_model_context_window(
+    endpoint: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> Option<usize> {
     let client = reqwest::Client::new();
     let models_url = format!("{}/models", endpoint);
 
-    let response = client.get(&models_url).send().await.ok()?;
+    let mut request = client.get(&models_url);
+    if let Some(key) = api_key {
+        request = request.header("Authorization", format!("Bearer {}", key));
+    }
+
+    let response = request.send().await.ok()?;
     let models_data: serde_json::Value = response.json().await.ok()?;
 
     let models_array = models_data.get("data")?.as_array()?;
@@ -585,6 +747,54 @@ async fn fetch_model_context_window(endpoint: &str, model: &str) -> Option<usize
     }
 
     None
+}
+
+async fn list_models(endpoint: &str, api_key: Option<&str>) -> Result<Vec<String>> {
+    let client = reqwest::Client::new();
+    let models_url = format!("{}/models", endpoint);
+
+    let mut request = client.get(&models_url);
+    if let Some(key) = api_key {
+        request = request.header("Authorization", format!("Bearer {}", key));
+    }
+
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unable to read error".to_string());
+        return Err(anyhow::anyhow!(
+            "HTTP {} from endpoint: {}",
+            status,
+            error_text
+        ));
+    }
+
+    let models_data: serde_json::Value = response.json().await?;
+    let models_array = models_data.get("data").and_then(|d| d.as_array());
+
+    let mut models = Vec::new();
+    if let Some(models_array) = models_array {
+        for model_info in models_array {
+            if let Some(id) = model_info.get("id").and_then(|id| id.as_str()) {
+                models.push(id.to_string());
+            }
+        }
+    }
+
+    models.sort();
+    Ok(models)
+}
+
+// Best-effort: returns Some(true) if the model is listed, Some(false) if not,
+// and None if the model list cannot be fetched or is empty (skip validation).
+async fn validate_model(endpoint: &str, model: &str, api_key: Option<&str>) -> Option<bool> {
+    match list_models(endpoint, api_key).await {
+        Ok(models) if !models.is_empty() => Some(models.iter().any(|m| m == model)),
+        _ => None,
+    }
 }
 
 fn open_internal_editor() -> Result<String> {
@@ -734,6 +944,41 @@ async fn handle_command(
                 width = HELP_WIDTH
             );
             println!(
+                "  {:<width$}  Set endpoint for this session (no config change)",
+                "/endpoint <url>".cyan(),
+                width = HELP_WIDTH
+            );
+            println!(
+                "  {:<width$}  Set endpoint and persist it to config file",
+                "/save-endpoint <url>".cyan(),
+                width = HELP_WIDTH
+            );
+            println!(
+                "  {:<width$}  Set API key for this session (no config change)",
+                "/api-key <key>".cyan(),
+                width = HELP_WIDTH
+            );
+            println!(
+                "  {:<width$}  Set API key and persist it to config file",
+                "/save-api-key <key>".cyan(),
+                width = HELP_WIDTH
+            );
+            println!(
+                "  {:<width$}  List models available on the endpoint",
+                "/models".cyan(),
+                width = HELP_WIDTH
+            );
+            println!(
+                "  {:<width$}  Set model for this session (no config change)",
+                "/model <name>".cyan(),
+                width = HELP_WIDTH
+            );
+            println!(
+                "  {:<width$}  Set model and persist it to config file",
+                "/save-model <name>".cyan(),
+                width = HELP_WIDTH
+            );
+            println!(
                 "  {:<width$}  Show session info and token usage",
                 "/info".cyan(),
                 width = HELP_WIDTH
@@ -760,7 +1005,7 @@ async fn handle_command(
             // Lets output the prompt, so that the user can see exactly what they sent to the
             // model
             println!("{content}");
-            let (_metrics, _total) = handle_prompt(content, messages, args, config).await?;
+            let (_metrics, _total) = handle_prompt(content, messages, config).await?;
         }
         "/system" => {
             if parts.len() > 1 {
@@ -809,11 +1054,123 @@ async fn handle_command(
                 println!("Usage: /seed <value> or /seed clear");
             }
         }
+        "/endpoint" | "/save-endpoint" => {
+            let persist = parts[0] == "/save-endpoint";
+            if parts.len() > 1 {
+                config.endpoint = parts[1].trim().to_string();
+                println!("Endpoint set to: {}", config.endpoint.cyan());
+            } else {
+                println!("Current endpoint: {}", config.endpoint.cyan());
+            }
+            if persist {
+                let mut cfg = load_config();
+                cfg.endpoint = Some(config.endpoint.clone());
+                save_config(&cfg)?;
+                println!(
+                    "{}",
+                    format!("Saved endpoint to config: {}", config_path().display()).green()
+                );
+            } else if parts.len() <= 1 {
+                println!("Usage: /endpoint <url>");
+            }
+        }
+        "/api-key" | "/save-api-key" => {
+            let persist = parts[0] == "/save-api-key";
+            let clear = parts.len() > 1 && parts[1].trim() == "clear";
+            if clear {
+                config.api_key = None;
+                println!("API key cleared.");
+            } else if parts.len() > 1 {
+                config.api_key = Some(parts[1].trim().to_string());
+                println!("API key set (stored in memory).");
+            } else {
+                match &config.api_key {
+                    Some(key) => println!("Current API key: {}", mask_key(key).cyan()),
+                    None => println!("Current API key: {} (not set)", "None".dimmed()),
+                }
+            }
+            if persist {
+                let mut cfg = load_config();
+                if clear {
+                    cfg.api_key = None;
+                } else if let Some(ref key) = config.api_key {
+                    cfg.api_key = Some(key.clone());
+                }
+                save_config(&cfg)?;
+                println!(
+                    "{}",
+                    format!("Saved API key setting to config: {}", config_path().display()).green()
+                );
+            }
+            if parts.len() <= 1 {
+                println!("Usage: /api-key <key> | /api-key clear");
+            }
+        }
+        "/models" => {
+            match list_models(&config.endpoint, config.api_key.as_deref()).await {
+                Ok(models) if models.is_empty() => {
+                    println!("No models found at endpoint.");
+                }
+                Ok(models) => {
+                    println!("{}", "Available Models:".green().bold());
+                    for model in &models {
+                        if *model == config.model {
+                            println!("  {} {}", "*".green().bold(), model.cyan());
+                        } else {
+                            println!("    {}", model);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "{}",
+                        format!("Error fetching models: {}", e).red()
+                    );
+                }
+            }
+        }
+        "/model" | "/save-model" => {
+            let persist = parts[0] == "/save-model";
+            if parts.len() > 1 {
+                config.model = parts[1].trim().to_string();
+                println!("Model set to: {}", config.model.cyan());
+                if validate_model(&config.endpoint, &config.model, config.api_key.as_deref())
+                    .await
+                    == Some(false)
+                {
+                    println!(
+                        "{}",
+                        format!(
+                            "Warning: Model '{}' is not in the endpoint's model list. Use /models to list available models.",
+                            config.model
+                        )
+                        .yellow()
+                    );
+                }
+            } else {
+                println!("Current model: {}", config.model.cyan());
+            }
+            if persist {
+                let mut cfg = load_config();
+                cfg.model = Some(config.model.clone());
+                save_config(&cfg)?;
+                println!(
+                    "{}",
+                    format!("Saved model to config: {}", config_path().display()).green()
+                );
+            } else if parts.len() <= 1 {
+                println!("Usage: /model <name> | /save-model <name>");
+            }
+        }
         "/config" => {
             println!("{}", "Current Configuration:".green().bold());
-            println!("  Model:       {}", args.model.cyan());
-            println!("  Endpoint:    {}", args.endpoint.cyan());
-            println!("  Max tokens:  {}", args.max_tokens.to_string().cyan());
+            println!("  Model:       {}", config.model.cyan());
+            println!("  Endpoint:    {}", config.endpoint.cyan());
+            match &config.api_key {
+                Some(key) => println!("  API key:     {}", mask_key(key).cyan()),
+                None => println!("  API key:     {}", "None".dimmed()),
+            }
+            println!("  Max tokens:  {}", args.max_tokens.unwrap_or(8192).to_string().cyan());
             println!("  Temperature: {}", config.temperature.to_string().cyan());
             match config.seed {
                 Some(s) => println!("  Seed:        {}", s.to_string().cyan()),
@@ -825,7 +1182,7 @@ async fn handle_command(
             }
         }
         "/info" => {
-            let max_tokens = args.max_tokens;
+            let max_tokens = args.max_tokens.unwrap_or(8192);
 
             println!("{}", "Session Information:".green().bold());
             println!("  Messages:    {}", messages.len());
@@ -864,7 +1221,6 @@ async fn handle_command(
 async fn handle_prompt(
     input: String,
     messages: &mut Vec<Message>,
-    args: &Args,
     config: &SessionConfig,
 ) -> Result<(Option<PromptMetrics>, Option<usize>)> {
     let trimmed = input.trim().to_string();
@@ -890,7 +1246,7 @@ async fn handle_prompt(
     }
 
     let client = reqwest::Client::new();
-    let url = format!("{}/chat/completions", args.endpoint);
+    let url = format!("{}/chat/completions", config.endpoint);
 
     let spinner = create_spinner("Waiting for response...");
 
@@ -899,7 +1255,7 @@ async fn handle_prompt(
     let mut token_count = 0;
 
     let mut request_body = json!({
-        "model": args.model,
+        "model": config.model.clone(),
         "messages": payload_msgs,
         "stream": true,
         "stream_options": {
@@ -912,7 +1268,12 @@ async fn handle_prompt(
         request_body["seed"] = json!(seed_value);
     }
 
-    let response = client.post(&url).json(&request_body).send().await;
+    let mut request = client.post(&url).json(&request_body);
+    if let Some(key) = &config.api_key {
+        request = request.header("Authorization", format!("Bearer {}", key));
+    }
+
+    let response = request.send().await;
 
     let response = match response {
         Ok(r) => r,
@@ -1086,7 +1447,7 @@ async fn run_benchmark(benchmark_file: &PathBuf, args: &Args) -> Result<()> {
     );
     println!(
         "Model: {} | Temperature: {} | Seed: {}",
-        args.model.cyan(),
+        args.model.as_deref().unwrap_or("local-model").cyan(),
         benchmark.temperature.to_string().cyan(),
         benchmark
             .seed
@@ -1094,11 +1455,14 @@ async fn run_benchmark(benchmark_file: &PathBuf, args: &Args) -> Result<()> {
             .unwrap_or("None".to_string())
             .cyan()
     );
-    println!("Endpoint: {}", args.endpoint.cyan());
+    println!("Endpoint: {}", args.endpoint.as_deref().unwrap_or("http://localhost:1234/v1").cyan());
     println!("Prompts: {}", benchmark.prompts.len());
     println!();
 
     let config = SessionConfig {
+        endpoint: args.endpoint.clone().unwrap_or_default(),
+        model: args.model.clone().unwrap_or_default(),
+        api_key: args.api_key.clone(),
         system_prompt: None,
         temperature: benchmark.temperature,
         seed: benchmark.seed,
@@ -1129,7 +1493,7 @@ async fn run_benchmark(benchmark_file: &PathBuf, args: &Args) -> Result<()> {
         );
         println!("{}", "━".repeat(80).dimmed());
 
-        let (metrics, _total) = handle_prompt(prompt.clone(), &mut messages, args, &config).await?;
+        let (metrics, _total) = handle_prompt(prompt.clone(), &mut messages, &config).await?;
         if let Some(m) = metrics {
             all_metrics.push(m);
         }
@@ -1163,8 +1527,8 @@ async fn run_benchmark(benchmark_file: &PathBuf, args: &Args) -> Result<()> {
     if let Some(output_file) = &args.benchmark_output {
         let results = BenchmarkResults {
             name: benchmark.name,
-            model: args.model.clone(),
-            endpoint: args.endpoint.clone(),
+            model: args.model.clone().unwrap_or_default(),
+            endpoint: args.endpoint.clone().unwrap_or_default(),
             temperature: benchmark.temperature,
             seed: benchmark.seed,
             timestamp: Utc::now().to_rfc3339(),
