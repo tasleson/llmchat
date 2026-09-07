@@ -55,6 +55,10 @@ struct Args {
     #[arg(long)]
     endpoint: Option<String>,
 
+    /// API key for authentication (Bearer token sent as Authorization header)
+    #[arg(long)]
+    api_key: Option<String>,
+
     /// Optional one-shot prompt
     prompt: Option<String>,
 
@@ -90,6 +94,7 @@ struct Args {
 struct SessionConfig {
     endpoint: String,
     model: String,
+    api_key: Option<String>,
     system_prompt: Option<String>,
     temperature: f32,
     seed: Option<i64>,
@@ -97,10 +102,11 @@ struct SessionConfig {
 }
 
 impl SessionConfig {
-    fn new(endpoint: String, model: String, temperature: f32, seed: Option<i64>) -> Self {
+    fn new(endpoint: String, model: String, api_key: Option<String>, temperature: f32, seed: Option<i64>) -> Self {
         Self {
             endpoint,
             model,
+            api_key,
             system_prompt: None,
             temperature,
             seed,
@@ -117,6 +123,9 @@ struct AppConfig {
     // Optional model identifier
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
+    // Optional API key (Authorization: Bearer header)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key: Option<String>,
     // Optional temperature (0.0-2.0, lower = more deterministic)
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
@@ -168,7 +177,23 @@ fn save_config(cfg: &AppConfig) -> Result<()> {
     }
     let data = serde_yaml::to_string(cfg)?;
     fs::write(&path, data)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Config may contain an API key; keep it private to the owner.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    }
     Ok(())
+}
+
+// Show only the last 4 chars of a secret, e.g. "*…1234"
+fn mask_key(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() <= 4 {
+        return "****".to_string();
+    }
+    let (head, tail) = chars.split_at(chars.len() - 4);
+    format!("{}…{}", "*".repeat(head.len()), tail.iter().collect::<String>())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -483,10 +508,16 @@ async fn main() -> Result<()> {
     args.temperature = args.temperature.or(app_config.temperature).or(Some(1.0));
     args.seed = args.seed.or(app_config.seed);
     args.max_tokens = args.max_tokens.or(app_config.max_tokens).or(Some(8192));
+    args.api_key = args
+        .api_key
+        .or(app_config.api_key)
+        .or_else(|| env::var("LLMCHAT_API_KEY").ok());
 
     // Try to auto-detect context window from model info
     if let (Some(endpoint), Some(model)) = (&args.endpoint, &args.model) {
-        if let Some(detected_context) = fetch_model_context_window(endpoint, model).await {
+        if let Some(detected_context) =
+            fetch_model_context_window(endpoint, model, args.api_key.as_deref()).await
+        {
             if args.max_tokens == Some(8192) {
                 // Only override if using default value
                 args.max_tokens = Some(detected_context);
@@ -508,6 +539,7 @@ async fn main() -> Result<()> {
     let mut config = SessionConfig::new(
         args.endpoint.clone().unwrap_or_default(),
         args.model.clone().unwrap_or_default(),
+        args.api_key.clone(),
         args.temperature.unwrap_or(1.0),
         args.seed,
     );
@@ -642,11 +674,20 @@ fn check_context_usage(
     }
 }
 
-async fn fetch_model_context_window(endpoint: &str, model: &str) -> Option<usize> {
+async fn fetch_model_context_window(
+    endpoint: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> Option<usize> {
     let client = reqwest::Client::new();
     let models_url = format!("{}/models", endpoint);
 
-    let response = client.get(&models_url).send().await.ok()?;
+    let mut request = client.get(&models_url);
+    if let Some(key) = api_key {
+        request = request.header("Authorization", format!("Bearer {}", key));
+    }
+
+    let response = request.send().await.ok()?;
     let models_data: serde_json::Value = response.json().await.ok()?;
 
     let models_array = models_data.get("data")?.as_array()?;
@@ -832,6 +873,16 @@ async fn handle_command(
                 width = HELP_WIDTH
             );
             println!(
+                "  {:<width$}  Set API key for this session (no config change)",
+                "/api-key <key>".cyan(),
+                width = HELP_WIDTH
+            );
+            println!(
+                "  {:<width$}  Set API key and persist it to config file",
+                "/save-api-key <key>".cyan(),
+                width = HELP_WIDTH
+            );
+            println!(
                 "  {:<width$}  Show session info and token usage",
                 "/info".cyan(),
                 width = HELP_WIDTH
@@ -927,10 +978,46 @@ async fn handle_command(
                 println!("Usage: /endpoint <url>");
             }
         }
+        "/api-key" | "/save-api-key" => {
+            let persist = parts[0] == "/save-api-key";
+            let clear = parts.len() > 1 && parts[1].trim() == "clear";
+            if clear {
+                config.api_key = None;
+                println!("API key cleared.");
+            } else if parts.len() > 1 {
+                config.api_key = Some(parts[1].trim().to_string());
+                println!("API key set (stored in memory).");
+            } else {
+                match &config.api_key {
+                    Some(key) => println!("Current API key: {}", mask_key(key).cyan()),
+                    None => println!("Current API key: {} (not set)", "None".dimmed()),
+                }
+            }
+            if persist {
+                let mut cfg = load_config();
+                if clear {
+                    cfg.api_key = None;
+                } else if let Some(ref key) = config.api_key {
+                    cfg.api_key = Some(key.clone());
+                }
+                save_config(&cfg)?;
+                println!(
+                    "{}",
+                    format!("Saved API key setting to config: {}", config_path().display()).green()
+                );
+            }
+            if parts.len() <= 1 {
+                println!("Usage: /api-key <key> | /api-key clear");
+            }
+        }
         "/config" => {
             println!("{}", "Current Configuration:".green().bold());
             println!("  Model:       {}", config.model.cyan());
             println!("  Endpoint:    {}", config.endpoint.cyan());
+            match &config.api_key {
+                Some(key) => println!("  API key:     {}", mask_key(key).cyan()),
+                None => println!("  API key:     {}", "None".dimmed()),
+            }
             println!("  Max tokens:  {}", args.max_tokens.unwrap_or(8192).to_string().cyan());
             println!("  Temperature: {}", config.temperature.to_string().cyan());
             match config.seed {
@@ -1029,7 +1116,12 @@ async fn handle_prompt(
         request_body["seed"] = json!(seed_value);
     }
 
-    let response = client.post(&url).json(&request_body).send().await;
+    let mut request = client.post(&url).json(&request_body);
+    if let Some(key) = &config.api_key {
+        request = request.header("Authorization", format!("Bearer {}", key));
+    }
+
+    let response = request.send().await;
 
     let response = match response {
         Ok(r) => r,
@@ -1218,6 +1310,7 @@ async fn run_benchmark(benchmark_file: &PathBuf, args: &Args) -> Result<()> {
     let config = SessionConfig {
         endpoint: args.endpoint.clone().unwrap_or_default(),
         model: args.model.clone().unwrap_or_default(),
+        api_key: args.api_key.clone(),
         system_prompt: None,
         temperature: benchmark.temperature,
         seed: benchmark.seed,
