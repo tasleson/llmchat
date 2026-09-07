@@ -137,20 +137,26 @@ struct AppConfig {
     max_tokens: Option<usize>,
 }
 
-// Config file lives in XDG config dir: $XDG_CONFIG_HOME/llmchat/config.yaml,
-// falling back to ~/.config/llmchat/config.yaml
-fn config_path() -> PathBuf {
+// Config and history live in XDG config dir: $XDG_CONFIG_HOME/llmchat/,
+// falling back to ~/.config/llmchat/
+fn config_dir() -> PathBuf {
     if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
-            return PathBuf::from(xdg).join("llmchat").join("config.yaml");
+            return PathBuf::from(xdg).join("llmchat");
         }
     }
     match env::var_os("HOME") {
-        Some(home) if !home.is_empty() => {
-            PathBuf::from(home).join(".config/llmchat/config.yaml")
-        }
-        _ => PathBuf::from(".config/llmchat/config.yaml"),
+        Some(home) if !home.is_empty() => PathBuf::from(home).join(".config/llmchat"),
+        _ => PathBuf::from(".config/llmchat"),
     }
+}
+
+fn config_path() -> PathBuf {
+    config_dir().join("config.yaml")
+}
+
+fn history_path() -> PathBuf {
+    config_dir().join("history")
 }
 
 fn load_config() -> AppConfig {
@@ -562,6 +568,10 @@ async fn main() -> Result<()> {
 
     // --- Interactive REPL ---
     let mut rl = Editor::<(), DefaultHistory>::new()?;
+    let history = history_path();
+    if history.exists() {
+        rl.load_history(&history)?;
+    }
     loop {
         let line = rl.readline(&format!("{}", "lms> ".green().bold()));
 
@@ -603,6 +613,11 @@ async fn main() -> Result<()> {
             Err(_) => break,
         }
     }
+
+    if let Some(parent) = history.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    rl.save_history(&history)?;
 
     Ok(())
 }
