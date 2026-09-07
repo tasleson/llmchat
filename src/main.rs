@@ -535,6 +535,24 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Best-effort: warn (but don't block) if the configured model isn't listed
+    // by the endpoint.
+    if let (Some(endpoint), Some(model)) = (&args.endpoint, &args.model) {
+        if validate_model(endpoint, model, args.api_key.as_deref())
+            .await
+            == Some(false)
+        {
+            eprintln!(
+                "{}",
+                format!(
+                    "Warning: Model '{}' is not in the endpoint's model list. Use /models to list available models.",
+                    model
+                )
+                .yellow()
+            );
+        }
+    }
+
     // --- Benchmark mode ---
     if let Some(ref benchmark_file) = args.benchmark {
         run_benchmark(benchmark_file, &args).await?;
@@ -731,6 +749,54 @@ async fn fetch_model_context_window(
     None
 }
 
+async fn list_models(endpoint: &str, api_key: Option<&str>) -> Result<Vec<String>> {
+    let client = reqwest::Client::new();
+    let models_url = format!("{}/models", endpoint);
+
+    let mut request = client.get(&models_url);
+    if let Some(key) = api_key {
+        request = request.header("Authorization", format!("Bearer {}", key));
+    }
+
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unable to read error".to_string());
+        return Err(anyhow::anyhow!(
+            "HTTP {} from endpoint: {}",
+            status,
+            error_text
+        ));
+    }
+
+    let models_data: serde_json::Value = response.json().await?;
+    let models_array = models_data.get("data").and_then(|d| d.as_array());
+
+    let mut models = Vec::new();
+    if let Some(models_array) = models_array {
+        for model_info in models_array {
+            if let Some(id) = model_info.get("id").and_then(|id| id.as_str()) {
+                models.push(id.to_string());
+            }
+        }
+    }
+
+    models.sort();
+    Ok(models)
+}
+
+// Best-effort: returns Some(true) if the model is listed, Some(false) if not,
+// and None if the model list cannot be fetched or is empty (skip validation).
+async fn validate_model(endpoint: &str, model: &str, api_key: Option<&str>) -> Option<bool> {
+    match list_models(endpoint, api_key).await {
+        Ok(models) if !models.is_empty() => Some(models.iter().any(|m| m == model)),
+        _ => None,
+    }
+}
+
 fn open_internal_editor() -> Result<String> {
     // Setup terminal
     enable_raw_mode()?;
@@ -898,6 +964,21 @@ async fn handle_command(
                 width = HELP_WIDTH
             );
             println!(
+                "  {:<width$}  List models available on the endpoint",
+                "/models".cyan(),
+                width = HELP_WIDTH
+            );
+            println!(
+                "  {:<width$}  Set model for this session (no config change)",
+                "/model <name>".cyan(),
+                width = HELP_WIDTH
+            );
+            println!(
+                "  {:<width$}  Set model and persist it to config file",
+                "/save-model <name>".cyan(),
+                width = HELP_WIDTH
+            );
+            println!(
                 "  {:<width$}  Show session info and token usage",
                 "/info".cyan(),
                 width = HELP_WIDTH
@@ -1023,6 +1104,62 @@ async fn handle_command(
             }
             if parts.len() <= 1 {
                 println!("Usage: /api-key <key> | /api-key clear");
+            }
+        }
+        "/models" => {
+            match list_models(&config.endpoint, config.api_key.as_deref()).await {
+                Ok(models) if models.is_empty() => {
+                    println!("No models found at endpoint.");
+                }
+                Ok(models) => {
+                    println!("{}", "Available Models:".green().bold());
+                    for model in &models {
+                        if *model == config.model {
+                            println!("  {} {}", "*".green().bold(), model.cyan());
+                        } else {
+                            println!("    {}", model);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "{}",
+                        format!("Error fetching models: {}", e).red()
+                    );
+                }
+            }
+        }
+        "/model" | "/save-model" => {
+            let persist = parts[0] == "/save-model";
+            if parts.len() > 1 {
+                config.model = parts[1].trim().to_string();
+                println!("Model set to: {}", config.model.cyan());
+                if validate_model(&config.endpoint, &config.model, config.api_key.as_deref())
+                    .await
+                    == Some(false)
+                {
+                    println!(
+                        "{}",
+                        format!(
+                            "Warning: Model '{}' is not in the endpoint's model list. Use /models to list available models.",
+                            config.model
+                        )
+                        .yellow()
+                    );
+                }
+            } else {
+                println!("Current model: {}", config.model.cyan());
+            }
+            if persist {
+                let mut cfg = load_config();
+                cfg.model = Some(config.model.clone());
+                save_config(&cfg)?;
+                println!(
+                    "{}",
+                    format!("Saved model to config: {}", config_path().display()).green()
+                );
+            } else if parts.len() <= 1 {
+                println!("Usage: /model <name> | /save-model <name>");
             }
         }
         "/config" => {
